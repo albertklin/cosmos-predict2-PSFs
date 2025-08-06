@@ -31,6 +31,8 @@ from cosmos_predict2.pipelines.video2world_action import Video2WorldActionCondit
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
 
+import time
+
 
 def get_action_sequence(annotation_path):
     with open(annotation_path, "r") as file:
@@ -93,10 +95,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
     parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument(
-        "--save_path",
+        "--save_dir",
         type=str,
-        default="output/generated_video.mp4",
-        help="Path to save the generated video (include file extension)",
+        default="output/generated_videos",
+        help="Directory to save the generated videos",
     )
     parser.add_argument(
         "--num_gpus",
@@ -108,6 +110,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--disable_prompt_refiner", action="store_true", help="Disable prompt refiner that enhances short prompts"
     )
+    parser.add_argument(
+        "--prompt", default=""
+    )
+    parser.add_argument(
+        "--negative_prompt", default=""
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=1
+    )
+    parser.add_argument(
+        "--num_generations", type=int, default=1, help="Number of generations to run"
+    )
     return parser.parse_args()
 
 
@@ -115,7 +129,8 @@ def setup_pipeline(args: argparse.Namespace):
     log.info(f"Using model size: {args.model_size}")
     if args.model_size == "2B":
         config = PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
-        dit_path = "checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pth"
+        # dit_path = "checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pth"
+        dit_path = "checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pt"
     else:
         raise ValueError("Invalid model size. Choose either '2B' or '14B'.")
     if hasattr(args, "dit_path") and args.dit_path:
@@ -157,7 +172,7 @@ def setup_pipeline(args: argparse.Namespace):
         text_encoder_path=text_encoder_path,
         device="cuda",
         torch_dtype=torch.bfloat16,
-        load_ema_to_reg=args.load_ema,
+        # load_ema_to_reg=args.load_ema,
         load_prompt_refiner=True,
     )
 
@@ -170,47 +185,58 @@ def read_first_frame(video_path):
 
 
 def process_single_generation(
-    pipe, input_path, input_annotation, output_path, guidance, seed, chunk_size, autoregressive
+    pipe, input_path, input_annotation, output_dir, guidance, seed, chunk_size, autoregressive
 ):
     actions = get_action_sequence(input_annotation)
     first_frame = read_first_frame(input_path)
+
+    first_frame = np.broadcast_to(first_frame, (args.batch_size, *first_frame.shape))
+    actions = np.broadcast_to(actions, (args.batch_size, *actions.shape))
 
     log.info(f"Running Video2WorldPipeline\ninput: {input_path}")
 
     if autoregressive:
         log.info("Using autoregressive mode")
         video_chunks = []
-        for i in range(0, len(actions), chunk_size):
-            if actions[i : i + chunk_size].shape[0] < chunk_size:
+        for i in range(0, actions.shape[1], chunk_size):
+            if actions.shape[1] - i < chunk_size:
                 log.info("Reached end of actions")
                 break
+            start_time = time.time()
             video = pipe(
                 first_frame,
-                actions[i : i + chunk_size],
+                actions[:, i : i + chunk_size],
                 num_conditional_frames=1,
                 guidance=guidance,
-                seed=i,
+                seed=seed+i,
+                prompt=args.prompt,
+                negative_prompt=args.negative_prompt,
             )
-            first_frame = ((video[0, :, -1].permute(1, 2, 0).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
+            print(f"Inference time: {time.time() - start_time:.2f} s")
+            first_frame = ((video[:, :, -1].permute(0, 2, 3, 1).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
             video_chunks.append(video)
-        video = torch.cat([video_chunks[0]] + [chunk[:, :, :-1] for chunk in video_chunks[1:]], dim=2)
+        video = torch.cat([video_chunks[0]] + [chunk[:, :, 1:] for chunk in video_chunks[1:]], dim=2)
     else:
+        start_time = time.time()
         video = pipe(
             first_frame,
-            actions[:chunk_size],
+            actions[:, :chunk_size],
             num_conditional_frames=1,
             guidance=guidance,
             seed=seed,
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
         )
+        print(f"Inference time: {time.time() - start_time:.2f} s")
 
     if video is not None:
-        # save the generated video
-        output_dir = os.path.dirname(output_path)
+        # save the generated videos
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        log.info(f"Saving generated video to: {output_path}")
-        save_image_or_video(video, output_path, fps=4)
-        log.success(f"Successfully saved video to: {output_path}")
+        log.info(f"Saving generated videos to: {output_dir}")
+        for i, v in enumerate(video):
+            save_image_or_video(v, os.path.join(output_dir, f"{i}.mp4"), fps=4)
+        log.success(f"Successfully saved videos to: {output_dir}")
         return True
     return False
 
@@ -220,7 +246,7 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldActionConditionedP
         pipe=pipe,
         input_path=args.input_video,
         input_annotation=args.input_annotation,
-        output_path=args.save_path,
+        output_dir=args.save_dir,
         guidance=args.guidance,
         seed=args.seed,
         chunk_size=args.chunk_size,
@@ -241,7 +267,12 @@ if __name__ == "__main__":
     args = parse_args()
     try:
         pipe = setup_pipeline(args)
-        generate_video(args, pipe)
+        seed = args.seed
+        save_dir = args.save_dir
+        for i in range(args.num_generations):
+            args.seed = seed + i
+            args.save_dir = os.path.join(save_dir, f"generation_{i}")
+            generate_video(args, pipe)
     finally:
         # Make sure to clean up the distributed environment
         cleanup_distributed()

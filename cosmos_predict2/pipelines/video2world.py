@@ -427,7 +427,7 @@ class Video2WorldPipeline(BasePipeline):
         """
         B, C, T, H, W = video.shape
 
-        self.batch_size = 1
+        self.batch_size = B
         data_batch = {
             "dataset_name": "video_data",
             "video": video,
@@ -504,6 +504,9 @@ class Video2WorldPipeline(BasePipeline):
                 def temporal_sample(video: torch.Tensor, expected_length: int) -> torch.Tensor:
                     # sample consecutive video frames to match expected_length
                     original_length = video.shape[2]
+                    if original_length == 1:
+                        log.info("Video is length 1. Returning an expanded view...")
+                        return video.expand(-1, -1, expected_length, -1, -1)
                     if original_length != expected_length:
                         # video in [B C T H W] format
                         start_frame = np.random.randint(0, original_length - expected_length)

@@ -195,7 +195,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         """
         B, C, T, H, W = video.shape
 
-        self.batch_size = 1
+        self.batch_size = B
         data_batch = {
             "dataset_name": "video_data",
             "video": video,
@@ -239,9 +239,13 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
 
         # num_video_frames = self.tokenizer.get_pixel_num_frames(self.config.state_t)
 
+        # # transform first frame and actions to tensor
+        # vid_input = torch.from_numpy(first_frame).permute(2, 0, 1)[None, :, None, ...]
+        # actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]
+
         # transform first frame and actions to tensor
-        vid_input = torch.from_numpy(first_frame).permute(2, 0, 1)[None, :, None, ...]
-        actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)[None, ...]
+        vid_input = torch.from_numpy(first_frame).permute(0, 3, 1, 2)[:, :, None, ...]
+        actions_tensor = torch.from_numpy(actions).to(dtype=torch.bfloat16)
 
         # Prepare the data batch with text embeddings
         data_batch = self._get_data_batch_input(

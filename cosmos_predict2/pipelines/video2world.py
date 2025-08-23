@@ -13,10 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import math
 import os
+from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Tuple, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -29,7 +31,6 @@ from torch.distributed.fsdp import FSDPModule, fully_shard
 from tqdm import tqdm
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
-from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
 from cosmos_predict2.conditioner import DataType, TextCondition
 from cosmos_predict2.configs.base.config_video2world import ConditioningStrategy, Video2WorldPipelineConfig
 from cosmos_predict2.datasets.utils import VIDEO_RES_SIZE_INFO
@@ -41,6 +42,10 @@ from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 from cosmos_predict2.utils.context_parallel import broadcast, broadcast_split_tensor, cat_outputs_cp, split_inputs_cp
 from cosmos_predict2.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
+from imaginaire.auxiliary.text_encoder import (
+    CosmosTextEncoder,
+    get_cosmos_text_encoder,
+)
 from imaginaire.lazy_config import instantiate
 from imaginaire.utils import log, misc
 from imaginaire.utils.easy_io import easy_io
@@ -71,7 +76,7 @@ def resize_input(video: torch.Tensor, resolution: list[int]) -> torch.Tensor:
     target_h, target_w = resolution
 
     scaling_ratio = max((target_w / orig_w), (target_h / orig_h))
-    resizing_shape = (int(math.ceil(scaling_ratio * orig_h)), int(math.ceil(scaling_ratio * orig_w)))
+    resizing_shape = (int(math.ceil(scaling_ratio * orig_h)), int(math.ceil(scaling_ratio * orig_w)))  # noqa: RUF046
     video_resized = torchvision.transforms.functional.resize(video, resizing_shape)
     video_cropped = torchvision.transforms.functional.center_crop(video_resized, resolution)
     return video_cropped
@@ -114,7 +119,7 @@ def read_and_process_image(
 
         # Calculate scaling based on aspect ratio
         scaling_ratio = max((target_w / orig_w), (target_h / orig_h))
-        resizing_shape = (int(math.ceil(scaling_ratio * orig_h)), int(math.ceil(scaling_ratio * orig_w)))
+        resizing_shape = (int(math.ceil(scaling_ratio * orig_h)), int(math.ceil(scaling_ratio * orig_w)))  # noqa: RUF046
 
         # Resize and crop the single image
         img_resized = torchvision.transforms.functional.resize(img.unsqueeze(0), resizing_shape).squeeze(0)
@@ -175,7 +180,7 @@ def read_and_process_video(
         video_frames, video_metadata = easy_io.load(video_path)  # Returns (T, H, W, C) numpy array
         log.info(f"Loaded video with shape {video_frames.shape}, metadata: {video_metadata}")
     except Exception as e:
-        raise ValueError(f"Failed to load video {video_path}: {e}")
+        raise ValueError(f"Failed to load video {video_path}: {e}")  # noqa: B904
 
     # Convert numpy array to tensor and rearrange dimensions
     video_tensor = torch.from_numpy(video_frames).float() / 255.0  # Convert to [0, 1] range
@@ -213,7 +218,7 @@ def read_and_process_video(
 
         # Calculate scaling based on aspect ratio
         scaling_ratio = max((target_w / W), (target_h / H))
-        resizing_shape = (int(math.ceil(scaling_ratio * H)), int(math.ceil(scaling_ratio * W)))
+        resizing_shape = (int(math.ceil(scaling_ratio * H)), int(math.ceil(scaling_ratio * W)))  # noqa: RUF046
 
         # Resize and crop the extracted frames
         extracted_frames = torchvision.transforms.functional.resize(extracted_frames, resizing_shape)
@@ -250,7 +255,7 @@ def read_and_process_video(
 class Video2WorldPipeline(BasePipeline):
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
-        self.text_encoder: CosmosT5TextEncoder = None
+        self.text_encoder: CosmosTextEncoder = None
         self.dit: torch.nn.Module = None
         self.dit_ema: torch.nn.Module = None
         self.tokenizer: TokenizerInterface = None
@@ -267,7 +272,9 @@ class Video2WorldPipeline(BasePipeline):
     def from_config(
         config: Video2WorldPipelineConfig,
         dit_path: str = "",
-        text_encoder_path: str = "",
+        use_text_encoder: bool = True,
+        offload_text_encoder: bool = False,
+        downcast_text_encoder: bool = False,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
@@ -302,24 +309,25 @@ class Video2WorldPipeline(BasePipeline):
 
         # 3. Set up tokenizer
         pipe.tokenizer = instantiate(config.tokenizer)
-        assert (
-            pipe.tokenizer.latent_ch == pipe.config.state_ch
-        ), f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+            f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        )
 
         # 4. Load text encoder
-        if text_encoder_path:
-            # inference
-            pipe.text_encoder = CosmosT5TextEncoder(device=device, cache_dir=text_encoder_path)
-            pipe.text_encoder.to(device)
+        if use_text_encoder:
+            pipe.text_encoder = get_cosmos_text_encoder(
+                config=config.text_encoder,
+                device="cpu" if offload_text_encoder else device,
+                torch_dtype=pipe.precision if downcast_text_encoder else None,
+            )
         else:
-            # training
             pipe.text_encoder = None
 
         # 5. Initialize conditioner
         pipe.conditioner = instantiate(config.conditioner)
-        assert (
-            sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0
-        ), "conditioner should not have learnable parameters"
+        assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+            "conditioner should not have learnable parameters"
+        )
 
         if load_prompt_refiner:
             pipe.prompt_refiner = CosmosReason1(
@@ -451,19 +459,26 @@ class Video2WorldPipeline(BasePipeline):
     def denoising_model(self) -> torch.nn.Module:
         return self.dit
 
-    def encode_prompt(
-        self, prompts: Union[str, List[str]], max_length: int = 512, return_mask: bool = False
-    ) -> torch.Tensor:
-        if isinstance(prompts, str):
-            prompts = [prompts]
+    def encode_prompt(self, prompts: str | list[str], max_length: int = 512, return_mask: bool = False) -> torch.Tensor:
+        offload_to_host = any([p.device.type == "cpu" for p in self.text_encoder.parameters()])
 
-        return self.text_encoder.encode_prompts(prompts, max_length=max_length, return_mask=return_mask)  # type: ignore
+        if offload_to_host:
+            self.text_encoder.to(device="cuda")
+
+        embeddings = self.text_encoder.encode_prompts(prompts, max_length=max_length, return_mask=return_mask)  # type: ignore
+
+        if offload_to_host:
+            self.text_encoder.to(device="cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        return embeddings
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         return self.tokenizer.decode(latent / self.sigma_data)
 
-    def _normalize_video_databatch_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:
+    def _normalize_video_databatch_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:  # noqa: RUF013
         """
         Normalizes video data in-place on a CUDA device to reduce data loading overhead.
 
@@ -491,9 +506,9 @@ class Video2WorldPipeline(BasePipeline):
             # Check if the data has already been normalized and avoid re-normalizing
             if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
                 assert torch.is_floating_point(data_batch[input_key]), "Video data is not in float format."
-                assert torch.all(
-                    (data_batch[input_key] >= -1.0001) & (data_batch[input_key] <= 1.0001)
-                ), f"Video data is not in the range [-1, 1]. get data range [{data_batch[input_key].min()}, {data_batch[input_key].max()}]"
+                assert torch.all((data_batch[input_key] >= -1.0001) & (data_batch[input_key] <= 1.0001)), (
+                    f"Video data is not in the range [-1, 1]. get data range [{data_batch[input_key].min()}, {data_batch[input_key].max()}]"
+                )
             else:
                 assert data_batch[input_key].dtype == torch.uint8, "Video data is not in uint8 format."
                 data_batch[input_key] = data_batch[input_key].to(**self.tensor_kwargs) / 127.5 - 1.0
@@ -519,14 +534,14 @@ class Video2WorldPipeline(BasePipeline):
                 if original_length != expected_length:
                     data_batch[input_key] = temporal_sample(data_batch[input_key], expected_length)
 
-    def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:
+    def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:  # noqa: RUF013
         input_key = self.input_image_key if input_key is None else input_key
         if input_key in data_batch:
             # Check if the data has already been augmented and avoid re-augmenting
             if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
-                assert (
-                    data_batch[input_key].shape[2] == 1
-                ), f"Image data is claimed be augmented while its shape is {data_batch[input_key].shape}"
+                assert data_batch[input_key].shape[2] == 1, (
+                    f"Image data is claimed be augmented while its shape is {data_batch[input_key].shape}"
+                )
                 return
             else:
                 data_batch[input_key] = rearrange(data_batch[input_key], "b c h w -> b c 1 h w").contiguous()
@@ -548,7 +563,7 @@ class Video2WorldPipeline(BasePipeline):
         condition: torch.Tensor,
         epsilon_B_C_T_H_W: torch.Tensor,
         sigma_B_T: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Broadcast and split the input data and condition for model parallelism.
         Currently, we only support context parallelism.
@@ -574,7 +589,7 @@ class Video2WorldPipeline(BasePipeline):
 
     def get_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, TextCondition]:
+    ) -> tuple[torch.Tensor, torch.Tensor, TextCondition]:
         self._normalize_video_databatch_inplace(data_batch)
         self._augment_image_dim_inplace(data_batch)
         is_image_batch = self.is_image_batch(data_batch)
@@ -601,9 +616,9 @@ class Video2WorldPipeline(BasePipeline):
         """
         is_image = self.input_image_key in data_batch
         is_video = self.input_video_key in data_batch
-        assert (
-            is_image != is_video
-        ), "Only one of the input_image_key or input_video_key should be present in the data_batch."
+        assert is_image != is_video, (
+            "Only one of the input_image_key or input_video_key should be present in the data_batch."
+        )
         return is_image
 
     def denoise(
@@ -698,7 +713,7 @@ class Video2WorldPipeline(BasePipeline):
 
     def get_x0_fn_from_batch(
         self,
-        data_batch: Dict,
+        data_batch: dict,
         guidance: float = 1.5,
         is_negative_prompt: bool = False,
         use_cuda_graphs: bool = False,
@@ -753,9 +768,9 @@ class Video2WorldPipeline(BasePipeline):
         _, uncondition, _, _ = self.broadcast_split_for_model_parallelsim(x0, uncondition, None, None)
 
         if not parallel_state.is_initialized():
-            assert (
-                not self.dit.is_context_parallel_enabled
-            ), "parallel_state is not initialized, context parallel should be turned off."
+            assert not self.dit.is_context_parallel_enabled, (
+                "parallel_state is not initialized, context parallel should be turned off."
+            )
 
         def x0_fn(noise_x: torch.Tensor, sigma: torch.Tensor) -> torch.Tensor:
             cond_x0 = self.denoise(noise_x, sigma, condition, use_cuda_graphs=use_cuda_graphs).x0
@@ -885,7 +900,7 @@ class Video2WorldPipeline(BasePipeline):
 
         x_sigma_max = (
             misc.arch_invariant_rand(
-                (n_sample,) + tuple(state_shape),
+                (n_sample,) + tuple(state_shape),  # noqa: RUF005
                 torch.float32,
                 self.tensor_kwargs["device"],
                 seed,

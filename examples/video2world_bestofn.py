@@ -21,26 +21,34 @@ import json
 import os
 import re
 import xml.etree.ElementTree as ET
-from typing import Any, Callable, Dict, List, Optional
+from collections.abc import Callable
+from typing import Any
 
 import torch
+
+from imaginaire.constants import (
+    COSMOS_REASON1_MODEL_DIR,
+    CosmosPredict2Video2WorldAspectRatio,
+    CosmosPredict2Video2WorldFPS,
+    CosmosPredict2Video2WorldModelSize,
+    CosmosPredict2Video2WorldResolution,
+)
 
 # Set TOKENIZERS_PARALLELISM environment variable to avoid deadlocks with multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
-from examples.video2world import _DEFAULT_NEGATIVE_PROMPT, cleanup_distributed
+from examples.video2world import _DEFAULT_NEGATIVE_PROMPT, cleanup_distributed, validate_input_file
 from examples.video2world import process_single_generation as process_single_generation_default
 from examples.video2world import setup_pipeline as setup_pipeline_default
-from examples.video2world import validate_input_file
 from examples.video2world_gr00t import process_single_generation as process_single_generation_gr00t
 from examples.video2world_gr00t import setup_pipeline as setup_pipeline_gr00t
 from imaginaire.utils import log
 from imaginaire.utils.distributed import get_rank
 
 
-def parse_response(response: str) -> Optional[Dict[str, Any]]:
+def parse_response(response: str) -> dict[str, Any] | None:
     try:
         wrapped = f"<root>{response.strip()}</root>"
         root = ET.fromstring(wrapped)
@@ -81,7 +89,7 @@ def video_to_base64(video_path: str) -> str:
         return base64.b64encode(video_file.read()).decode("utf-8")
 
 
-def build_html_report(video_path: str, responses: List[str]) -> str:
+def build_html_report(video_path: str, responses: list[str]) -> str:
     # Convert video to base64
     video_base64 = video_to_base64(video_path)
     mime_type = "video/mp4"
@@ -137,7 +145,7 @@ def build_html_report(video_path: str, responses: List[str]) -> str:
     <h2>Detailed Analysis ({len(responses)} trials)</h2>
 """
 
-    for i, (response, parsed) in enumerate(zip(responses, parsed_responses), 1):
+    for i, (response, parsed) in enumerate(zip(responses, parsed_responses, strict=False), 1):  # noqa: B007
         if parsed is not None:
             answer = parsed.get("answer", "").lower()
             answer_class = "red" if answer == "yes" else "green"
@@ -160,8 +168,8 @@ def build_html_report(video_path: str, responses: List[str]) -> str:
                     comp_class = "red" if anomaly == "yes" else "green"
                     html += f"""
         <div class="{comp_class}">
-            <strong>{comp.get('name', 'Unknown Component')} - {comp.get('anomaly', '')}</strong>
-            <p>{comp.get('analysis', 'No analysis provided')}</p>
+            <strong>{comp.get("name", "Unknown Component")} - {comp.get("anomaly", "")}</strong>
+            <p>{comp.get("analysis", "No analysis provided")}</p>
         </div>
 """
 
@@ -180,7 +188,7 @@ def build_html_report(video_path: str, responses: List[str]) -> str:
     return html
 
 
-def count_answers(responses: List[str]) -> tuple[int, int]:
+def count_answers(responses: list[str]) -> tuple[int, int]:
     no_count = 0
     total_parsed = 0
     for response in responses:
@@ -197,20 +205,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Best-of-N Video Generation with Cosmos Predict2")
     parser.add_argument(
         "--model_size",
-        choices=["2B", "14B"],
+        choices=CosmosPredict2Video2WorldModelSize.__args__,
         default="2B",
         help="Size of the model to use for video-to-world generation",
     )
     parser.add_argument(
         "--resolution",
-        choices=["480", "720"],
+        choices=CosmosPredict2Video2WorldResolution.__args__,
         default="720",
         type=str,
         help="Resolution of the model to use for video-to-world generation",
     )
     parser.add_argument(
         "--fps",
-        choices=[10, 16],
+        choices=CosmosPredict2Video2WorldFPS.__args__,
         default=16,
         type=int,
         help="FPS of the model to use for video-to-world generation",
@@ -246,7 +254,7 @@ def parse_args():
     )
     parser.add_argument(
         "--aspect_ratio",
-        choices=["1:1", "4:3", "3:4", "16:9", "9:16"],
+        choices=CosmosPredict2Video2WorldAspectRatio.__args__,
         default="16:9",
         type=str,
         help="Aspect ratio of the generated output (width:height)",
@@ -277,6 +285,14 @@ def parse_args():
     parser.add_argument(
         "--offload_prompt_refiner", action="store_true", help="Offload prompt refiner to CPU to save GPU memory"
     )
+    parser.add_argument(
+        "--offload_text_encoder", action="store_true", help="Offload text encoder to CPU to save GPU memory"
+    )
+    parser.add_argument(
+        "--downcast_text_encoder",
+        action="store_true",
+        help="Cast text encoder from checkpoint precision to pipeline precision",
+    )
     # GR00T-specific settings. Specify --gr00t_variant to enable
     parser.add_argument("--gr00t_variant", type=str, default="", help="GR00T variant to use", choices=["gr1", "droid"])
     parser.add_argument(
@@ -291,7 +307,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoint_dir",
         type=str,
-        default="checkpoints/nvidia/Cosmos-Reason1-7B",
+        default=COSMOS_REASON1_MODEL_DIR,
         help="Path to the Cosmos-Reason1 checkpoint",
     )
     return parser.parse_args()
@@ -299,7 +315,7 @@ def parse_args():
 
 def generate_video(
     args: argparse.Namespace, pipe: Video2WorldPipeline, process_single_generation: Callable
-) -> List[str]:
+) -> list[str]:
     if not validate_input_file(args.input_path, args.num_conditional_frames):
         log.error(f"Input file validation failed: {args.input_path}")
         return []
@@ -442,7 +458,7 @@ if __name__ == "__main__":
                 log.info("-" * 80)
 
                 # Sort videos by score (highest first)
-                sorted_results = sorted(zip(scores, video_paths), key=lambda x: x[0], reverse=True)
+                sorted_results = sorted(zip(scores, video_paths, strict=False), key=lambda x: x[0], reverse=True)
 
                 for i, (score, video_path) in enumerate(sorted_results, 1):
                     video_name = os.path.basename(video_path)

@@ -26,7 +26,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import is_dataclass
-from typing import Any, Dict, List, Tuple, Union
+from typing import TYPE_CHECKING, Any, Generic, TypeAlias, TypeVar, cast
 
 import attrs
 import yaml
@@ -47,10 +47,12 @@ except ImportError:
 from imaginaire.lazy_config.file_io import PathManager
 from imaginaire.lazy_config.registry import _convert_target_to_string
 
-__all__ = ["LazyCall", "LazyConfig"]
+__all__ = ["LazyCall", "LazyConfig", "LazyDict"]
+
+T = TypeVar("T")
 
 
-def sort_dict(d: Dict[str, Any]) -> OrderedDict[str, Any]:
+def sort_dict(d: dict[str, Any]) -> OrderedDict[str, Any]:
     return OrderedDict(sorted(d.items(), key=lambda x: x[0]))
 
 
@@ -58,7 +60,7 @@ def dict_representer(dumper: yaml.Dumper, data: OrderedDict[str, Any]) -> yaml.n
     return dumper.represent_mapping("tag:yaml.org,2002:map", data.items())
 
 
-def sort_recursive(obj: Union[Dict[str, Any], List[Any], Any]) -> Union[OrderedDict[str, Any], List[Any], Any]:
+def sort_recursive(obj: dict[str, Any] | list[Any] | Any) -> OrderedDict[str, Any] | list[Any] | Any:
     if isinstance(obj, dict):
         return sort_dict({k: sort_recursive(v) for k, v in obj.items()})
     elif isinstance(obj, list):
@@ -86,7 +88,16 @@ def get_default_params(cls_or_func):
     return default_params
 
 
-class LazyCall:
+if TYPE_CHECKING:
+    # Have `LazyDict[T]` behave as `T`, so that attribute access works. Ideally, it
+    # would be a subclass of `T`, but this doesn't seem to be possible in the type
+    # system yet.
+    LazyDict: TypeAlias = T
+else:
+    LazyDict = DictConfig
+
+
+class LazyCall(Generic[T]):
     """
     Wrap a callable so that when it's called, the call will not be executed,
     but returns a dict that describes the call.
@@ -103,12 +114,12 @@ class LazyCall:
         layer = instantiate(layer_cfg)
     """
 
-    def __init__(self, target):
+    def __init__(self, target: type[T]):
         if not (callable(target) or isinstance(target, (str, abc.Mapping))):
             raise TypeError(f"target of LazyCall must be a callable or defines a callable! Got {target}")
         self._target = target
 
-    def __call__(self, **kwargs):
+    def __call__(self, **kwargs) -> LazyDict[T]:
         if is_dataclass(self._target) or attrs.has(self._target):
             # omegaconf object cannot hold dataclass type
             # https://github.com/omry/omegaconf/issues/784
@@ -120,7 +131,7 @@ class LazyCall:
         _final_params = get_default_params(self._target)
         _final_params.update(kwargs)
 
-        return DictConfig(content=_final_params, flags={"allow_objects": True})
+        return cast(LazyDict[T], DictConfig(content=_final_params, flags={"allow_objects": True}))
 
 
 def _visit_dict_config(cfg, func):
@@ -183,9 +194,7 @@ def _patch_import():
         relative_import_err = """
 Relative import of directories is not allowed within config files.
 Within a config file, relative import can only import other config files.
-""".replace(
-            "\n", " "
-        )
+""".replace("\n", " ")
         if not len(relative_import_path):
             raise ImportError(relative_import_err)
 
@@ -203,16 +212,14 @@ Within a config file, relative import can only import other config files.
                 raise ImportError(f"Cannot import from {cur_file_no_suffix}." + relative_import_err)
             else:
                 raise ImportError(
-                    f"Cannot import name {relative_import_path} from " f"{original_file}: {cur_file} does not exist."
+                    f"Cannot import name {relative_import_path} from {original_file}: {cur_file} does not exist."
                 )
         return cur_file
 
     def new_import(name, globals=None, locals=None, fromlist=(), level=0):
         if (
             # Only deal with relative imports inside config files
-            level != 0
-            and globals is not None
-            and (globals.get("__package__", "") or "").startswith(_CFG_PACKAGE_NAME)
+            level != 0 and globals is not None and (globals.get("__package__", "") or "").startswith(_CFG_PACKAGE_NAME)
         ):
             cur_file = find_relative_file(globals["__file__"], name, level)
             _validate_py_syntax(cur_file)
@@ -240,7 +247,7 @@ class LazyConfig:
     """
 
     @staticmethod
-    def load_rel(filename: str, keys: Union[None, str, Tuple[str, ...]] = None):
+    def load_rel(filename: str, keys: None | str | tuple[str, ...] = None):
         """
         Similar to :meth:`load()`, but load path relative to the caller's
         source file.
@@ -256,7 +263,7 @@ class LazyConfig:
         return LazyConfig.load(filename, keys)
 
     @staticmethod
-    def load(filename: str, keys: Union[None, str, Tuple[str, ...]] = None):
+    def load(filename: str, keys: None | str | tuple[str, ...] = None):
         """
         Load a config file.
 
@@ -427,7 +434,7 @@ class LazyConfig:
         # Serialize the DictConfig object by converting non-serializable objects to strings.
         config_omegaconf = serialize_config(config_omegaconf)
 
-        config_dict: Dict[str, Any] = OmegaConf.to_container(config_omegaconf, resolve=True)
+        config_dict: dict[str, Any] = OmegaConf.to_container(config_omegaconf, resolve=True)
         sorted_config: OrderedDict[str, Any] = sort_recursive(config_dict)
         with open(filename, "w") as f:
             yaml.dump(sorted_config, f, default_flow_style=False)

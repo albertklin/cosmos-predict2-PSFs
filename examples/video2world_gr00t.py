@@ -19,9 +19,16 @@ A variant of predict2_video2world.py for GR00T models that:
 2. Turns off the guardrail and prompt refiner
 3. Supports two GR00T variants: GR1 and DROID
 """
+
 import argparse
 import json
 import os
+
+from imaginaire.constants import (
+    CosmosPredict2Gr00tModelSize,
+    CosmosPredict2Video2WorldAspectRatio,
+    get_cosmos_predict2_gr00t_checkpoint,
+)
 
 # Set TOKENIZERS_PARALLELISM environment variable to avoid deadlocks with multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -30,7 +37,7 @@ import torch
 from megatron.core import parallel_state
 from tqdm import tqdm
 
-from cosmos_predict2.configs.base.config_video2world import PREDICT2_VIDEO2WORLD_PIPELINE_14B
+from cosmos_predict2.configs.base.config_video2world import get_cosmos_predict2_video2world_pipeline
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from examples.video2world import _DEFAULT_NEGATIVE_PROMPT, validate_input_file
 from imaginaire.utils import distributed, log, misc
@@ -41,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="GR00T Video-to-World Generation with Cosmos Predict2")
     parser.add_argument(
         "--model_size",
-        choices=["14B"],
+        choices=CosmosPredict2Gr00tModelSize.__args__,
         default="14B",
         help="Size of the model to use for GR00T video-to-world generation",
     )
@@ -76,7 +83,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--aspect_ratio",
-        choices=["1:1", "4:3", "3:4", "16:9", "9:16"],
+        choices=CosmosPredict2Video2WorldAspectRatio.__args__,
         default="16:9",
         type=str,
         help="Aspect ratio of the generated output (width:height)",
@@ -124,24 +131,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def setup_pipeline(args: argparse.Namespace):
-    log.info(f"Using model size: {args.model_size} with GR00T variant: {args.gr00t_variant}")
-
-    # Only 14B models are supported for GR00T
-    if args.model_size == "14B":
-        config = PREDICT2_VIDEO2WORLD_PIPELINE_14B
-        config.resolution = "480"  # GR00T models use 480p resolution
-        config.prompt_refiner_config.enabled = False
-
-        if args.gr00t_variant == "gr1":
-            dit_path = "checkpoints/nvidia/Cosmos-Predict2-14B-Sample-GR00T-Dreams-GR1/model-480p-16fps.pt"
-        elif args.gr00t_variant == "droid":
-            dit_path = "checkpoints/nvidia/Cosmos-Predict2-14B-Sample-GR00T-Dreams-DROID/model-480p-16fps.pt"
-    else:
-        raise ValueError("Only 14B model size is supported for GR00T variants")
-
+    resolution = "480"
+    fps = 16
+    config = get_cosmos_predict2_video2world_pipeline(model_size=args.model_size, resolution=resolution, fps=fps)
+    config.prompt_refiner_config.enabled = False
     if args.dit_path:
         dit_path = args.dit_path
-    text_encoder_path = "checkpoints/google-t5/t5-11b"
+    else:
+        dit_path = get_cosmos_predict2_gr00t_checkpoint(
+            gr00t_variant=args.gr00t_variant,
+            model_size=args.model_size,
+            resolution=resolution,
+            fps=fps,
+            aspect_ratio=args.aspect_ratio,
+        )
     log.info(f"Loading model from: {dit_path}")
 
     misc.set_random_seed(seed=args.seed, by_rank=True)
@@ -169,7 +172,6 @@ def setup_pipeline(args: argparse.Namespace):
     pipe = Video2WorldPipeline.from_config(
         config=config,
         dit_path=dit_path,
-        text_encoder_path=text_encoder_path,
         device="cuda",
         torch_dtype=torch.bfloat16,
         load_ema_to_reg=args.load_ema,
@@ -239,7 +241,7 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
     if args.batch_input_json is not None:
         # Process batch inputs from JSON file
         log.info(f"Loading batch inputs from JSON file: {args.batch_input_json}")
-        with open(args.batch_input_json, "r") as f:
+        with open(args.batch_input_json) as f:
             batch_inputs = json.load(f)
 
         for idx, item in enumerate(tqdm(batch_inputs)):

@@ -17,6 +17,12 @@ import argparse
 import json
 import os
 
+from imaginaire.constants import (
+    CosmosPredict2Text2ImageModelSize,
+    CosmosPredict2Video2WorldFPS,
+    CosmosPredict2Video2WorldResolution,
+)
+
 # Set TOKENIZERS_PARALLELISM environment variable to avoid deadlocks with multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -42,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     # Common arguments between text2image and video2world
     parser.add_argument(
         "--model_size",
-        choices=["2B", "14B"],
+        choices=CosmosPredict2Text2ImageModelSize.__args__,
         default="2B",
         help="Size of the model to use for text2world generation",
     )
@@ -92,14 +98,14 @@ def parse_args() -> argparse.Namespace:
     # Video2world specific arguments
     parser.add_argument(
         "--resolution",
-        choices=["480", "720"],
+        choices=CosmosPredict2Video2WorldResolution.__args__,
         default="720",
         type=str,
         help="Resolution of the model to use for video-to-world generation",
     )
     parser.add_argument(
         "--fps",
-        choices=[10, 16],
+        choices=CosmosPredict2Video2WorldFPS.__args__,
         default=16,
         type=int,
         help="FPS of the model to use for video-to-world generation",
@@ -130,6 +136,14 @@ def parse_args() -> argparse.Namespace:
         "--offload_prompt_refiner", action="store_true", help="Offload prompt refiner to CPU to save GPU memory"
     )
     parser.add_argument(
+        "--offload_text_encoder", action="store_true", help="Offload text encoder to CPU to save GPU memory"
+    )
+    parser.add_argument(
+        "--downcast_text_encoder",
+        action="store_true",
+        help="Cast text encoder from checkpoint precision to pipeline precision",
+    )
+    parser.add_argument(
         "--natten",
         action="store_true",
         help="Run the sparse attention variant (with NATTEN).",
@@ -157,7 +171,7 @@ def generate_first_frames(text2image_pipe: Text2ImagePipeline, args: argparse.Na
         if args.batch_input_json is not None:
             # Process batch inputs from JSON file
             log.info(f"Loading batch inputs from JSON file: {args.batch_input_json}")
-            with open(args.batch_input_json, "r") as f:
+            with open(args.batch_input_json) as f:
                 batch_inputs = json.load(f)
 
             # Generate all the first frames first
@@ -289,6 +303,7 @@ if __name__ == "__main__":
 
         log.info("Step 1: Initializing text2image pipeline...")
         args.dit_path = args.dit_path_text2image
+        args.use_fast_tokenizer = False  # use_fast_tokenizer is currently support only for 0.6B text2image. It is not supported for text2world models (2B / 14B).
         text2image_pipe = setup_text2image_pipeline(args)
 
         # Handle the case where setup_text2image_pipeline returns None for non-rank-0 processes

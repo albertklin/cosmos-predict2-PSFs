@@ -19,7 +19,7 @@ import pkgutil
 import sys
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
-from typing import Any, Dict, Optional
+from typing import Any
 
 import attr
 import attrs
@@ -66,7 +66,7 @@ def get_fields(obj):
         raise ValueError("The object is neither an attrs class nor a dataclass.")
 
 
-def override(config: Config, overrides: Optional[list[str]] = None) -> Config:
+def override(config: Config, overrides: list[str] | None = None) -> Config:
     """
     :param config: the instance of class `Config` (usually from `make_config`)
     :param overrides: list of overrides for config
@@ -114,18 +114,18 @@ def override(config: Config, overrides: Optional[list[str]] = None) -> Config:
             return kwargs
         else:
             ref_fields = set(get_fields(ref_instance))
-            assert isinstance(kwargs, dict) or isinstance(
-                kwargs, DictConfig
-            ), "kwargs must be a dictionary or a DictConfig"
+            assert isinstance(kwargs, dict) or isinstance(kwargs, DictConfig), (
+                "kwargs must be a dictionary or a DictConfig"
+            )
             keys = set(kwargs.keys())
 
             # ref_fields must equal to or include all keys
             extra_keys = keys - ref_fields
-            assert ref_fields == keys or keys.issubset(
-                ref_fields
-            ), f"Fields mismatch: {ref_fields} != {keys}. Extra keys found: {extra_keys} \n \t when constructing {type(ref_instance)} with {keys}"
+            assert ref_fields == keys or keys.issubset(ref_fields), (
+                f"Fields mismatch: {ref_fields} != {keys}. Extra keys found: {extra_keys} \n \t when constructing {type(ref_instance)} with {keys}"
+            )
 
-            resolved_kwargs: Dict[str, Any] = {}
+            resolved_kwargs: dict[str, Any] = {}
             for f in keys:
                 resolved_kwargs[f] = config_from_dict(getattr(ref_instance, f), kwargs[f])
             try:

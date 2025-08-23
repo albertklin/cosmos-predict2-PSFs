@@ -14,7 +14,9 @@
 # limitations under the License.
 
 """A rework of make_graphed_callabled function from TransformerEngine so that it works with inference-only."""
-from typing import Any, Callable, Dict, Optional, Tuple, TypeVar, Union
+
+from collections.abc import Callable
+from typing import Any, TypeVar, Union
 
 import torch
 from torch._C import _graph_pool_handle
@@ -31,7 +33,7 @@ __all__ = ["create_cuda_graph"]
 _IS_GRAPH_CAPTURING = False
 
 _T = TypeVar("_T")
-SingleOrTuple = Union[_T, Tuple[_T, ...]]
+SingleOrTuple = Union[_T, tuple[_T, ...]]  # noqa: UP007
 
 
 def set_capture_start() -> None:
@@ -60,10 +62,10 @@ def graph_pool_handle():
 
 def _make_graphed_callables(
     callables: SingleOrTuple[Callable],
-    sample_args: SingleOrTuple[Tuple[torch.Tensor, ...]],
+    sample_args: SingleOrTuple[tuple[torch.Tensor, ...]],
     num_warmup_iters: int = 3,
-    sample_kwargs: Optional[SingleOrTuple[Dict[str, Any]]] = None,
-    pool: Optional[Tuple[int, ...]] = None,
+    sample_kwargs: SingleOrTuple[dict[str, Any]] | None = None,
+    pool: tuple[int, ...] | None = None,
 ) -> SingleOrTuple[Callable]:
     """
     Helper method for `make_graphed_callables`
@@ -71,7 +73,7 @@ def _make_graphed_callables(
 
     if torch.is_autocast_enabled() and torch.is_autocast_cache_enabled():
         raise RuntimeError(
-            "make_graphed_callables does not support the autocast " "caching. Please set `cache_enabled=False`."
+            "make_graphed_callables does not support the autocast caching. Please set `cache_enabled=False`."
         )
 
     # Default is to pass no kwargs to callables
@@ -98,25 +100,24 @@ def _make_graphed_callables(
         if isinstance(c, torch.nn.Module):
             assert len(c._backward_hooks) == 0 and len(c._forward_hooks) == 0 and len(c._forward_pre_hooks) == 0, (
                 "Modules must not have hooks registered at the time they are passed. "
-                + "However, registering hooks on modules after passing them "
-                + "through make_graphed_callables is allowed."
+                "However, registering hooks on modules after passing them "
+                "through make_graphed_callables is allowed."
             )
             assert all(b.requires_grad is False for b in c.buffers()), (
                 "In any :class:`~torch.nn.Module` passed to "
-                + ":func:`~make_graphed_callables`, only parameters may be trainable. "
-                + "All buffers must have ``requires_grad=False``."
+                ":func:`~make_graphed_callables`, only parameters may be trainable. "
+                "All buffers must have ``requires_grad=False``."
             )
 
     # Flatten callable arguments
     per_callable_kwargs_keys = [list(kwargs.keys()) for kwargs in sample_kwargs]
     flatten_sample_args = []
-    for args, kwargs, kwargs_keys in zip(sample_args, sample_kwargs, per_callable_kwargs_keys):
+    for args, kwargs, kwargs_keys in zip(sample_args, sample_kwargs, per_callable_kwargs_keys, strict=False):
         flatten_arg, _ = _tree_flatten(args)
         flatten_kwarg, _ = _tree_flatten([kwargs[key] for key in kwargs_keys])
         flatten_sample_args.append(tuple(flatten_arg + flatten_kwarg))
         assert all(isinstance(arg, torch.Tensor) for arg in flatten_arg), (
-            "In the beta API, sample_args "
-            + "for each callable must contain only Tensors. Other types are not allowed."
+            "In the beta API, sample_args for each callable must contain only Tensors. Other types are not allowed."
         )
 
     # If a callable is an nn.Module, its graph's full input surface is the args the user explicitly
@@ -150,9 +151,9 @@ def _make_graphed_callables(
         warmup_func_idx.append(func_idx)
         warmup_func.append(func)
     assert len(warmup_func) == len(sample_args), f"Warmup runs {len(warmup_func)} don't match args {len(sample_args)}."
-    assert len(warmup_func_idx) == len(
-        set(warmup_func_idx)
-    ), f"Warmup runs {len(warmup_func)} but only {len(set(warmup_func_idx))} are unique."
+    assert len(warmup_func_idx) == len(set(warmup_func_idx)), (
+        f"Warmup runs {len(warmup_func)} but only {len(set(warmup_func_idx))} are unique."
+    )
 
     # Filter the TE modules that cudagraph can access.
     visited_te_modules = set()
@@ -163,7 +164,7 @@ def _make_graphed_callables(
 
     # Run warmup and do the above filtering.
     with torch.cuda.stream(torch.cuda.Stream()):
-        for func_idx, func in zip(warmup_func_idx, warmup_func):
+        for func_idx, func in zip(warmup_func_idx, warmup_func, strict=False):
             args = sample_args[func_idx]
             kwargs = sample_kwargs[func_idx]
             for _ in range(num_warmup_iters):
@@ -188,7 +189,7 @@ def _make_graphed_callables(
     per_callable_static_outputs = []
     per_callable_output_unflatten_spec = []
     graph_id = 0
-    for func, args, kwargs, fwd_graph in zip(callables, sample_args, sample_kwargs, fwd_graphs):
+    for func, args, kwargs, fwd_graph in zip(callables, sample_args, sample_kwargs, fwd_graphs, strict=False):
         with torch.cuda.graph(fwd_graph, pool=mempool):
             outputs = func(*args, **kwargs)
         graph_callables[graph_id] = func
@@ -229,7 +230,7 @@ def _make_graphed_callables(
             for key in kwargs_keys:
                 if key not in user_kwargs:
                     raise TypeError(
-                        f"Graphed callable was initialized with kwarg {key} ," "but it was not provided in graph replay"
+                        f"Graphed callable was initialized with kwarg {key} ,but it was not provided in graph replay"
                     )
 
             # Runs the autograd function with inputs == all inputs to
@@ -283,11 +284,11 @@ def _make_graphed_callables(
 
 def make_graphed_callables_forward(
     modules: SingleOrTuple[Callable],
-    sample_args: SingleOrTuple[Tuple[torch.Tensor, ...]],
+    sample_args: SingleOrTuple[tuple[torch.Tensor, ...]],
     num_warmup_iters: int = 3,
-    sample_kwargs: Optional[SingleOrTuple[Dict[str, Any]]] = None,
-    pool: Optional[Tuple[int, ...]] = None,
-) -> Union[Callable, Tuple[Callable, ...]]:
+    sample_kwargs: SingleOrTuple[dict[str, Any]] | None = None,
+    pool: tuple[int, ...] | None = None,
+) -> Callable | tuple[Callable, ...]:
     """
     Make CUDA graph version of Transformer Engine modules
     A variation of PyTorch's `make_graphed_callables` utility function.
@@ -345,7 +346,7 @@ def make_graphed_callables_forward(
 
     # Ensures warmup does not affect numerics for ops such as dropout.
     if graph_safe_rng_available():
-        for gen, state in zip(generators, original_rng_states):
+        for gen, state in zip(generators, original_rng_states, strict=False):
             gen.set_state(state)
     else:
         torch.cuda.set_rng_state(original_rng_states)

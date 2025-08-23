@@ -2,6 +2,32 @@
 
 We'd love to receive your patches and contributions. Please keep your PRs as draft until such time that you would like us to review them.
 
+## Testing
+
+Install system dependencies:
+
+[just](https://just.systems/man/en/pre-built-binaries.html#pre-built-binaries)
+
+```shell
+mkdir -p "$HOME/.local"
+curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash -s -- --to "$HOME/.local/bin"
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+To test your changes locally, run
+
+```shell
+just test
+```
+
+This will also run auto-fixes and linting. We recommend that you commit your changes first.
+
+To see all available commands, run
+
+```shell
+just
+```
+
 ## Code Reviews
 
 All submissions, including submissions by project members, require review. We use GitHub pull requests for this purpose. Consult

@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import random
-from typing import Optional
 
 import numpy as np
 import torch
@@ -64,7 +63,7 @@ def pad_and_resize(
 
 
 class TextTransformForVideo(Augmentor):
-    def __init__(self, input_keys: dict, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
+    def __init__(self, input_keys: dict, output_keys: list | None = None, args: dict | None = None) -> None:
         super().__init__(input_keys, output_keys, args)
 
         # our caption is saved in json with format: {"<key>": "xxx", "<caption_windows_key1>": [{"start_frame": x, "end_frame": x, "<caption_type>": xxx}, ...], "<caption_windows_key2>": [{"start_frame":...]}
@@ -100,9 +99,9 @@ class TextTransformForVideo(Augmentor):
             "medium": f"{self.embedding_caption_type}_medium",
             "user": f"{self.embedding_caption_type}_user",
         }
-        assert (
-            self.caption_probs.keys() == self.caption_style_mapping.keys() == self.embedding_style_mapping.keys()
-        ), "The keys for caption_probs, caption_style_mapping, and embedding_style_mapping should match"
+        assert self.caption_probs.keys() == self.caption_style_mapping.keys() == self.embedding_style_mapping.keys(), (
+            "The keys for caption_probs, caption_style_mapping, and embedding_style_mapping should match"
+        )
 
     def __call__(self, data_dict: dict) -> dict:
         r"""Performs text transformation.

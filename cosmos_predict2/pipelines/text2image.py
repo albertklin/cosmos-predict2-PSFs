@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from typing import Any, List, Tuple, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -24,8 +24,8 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, fully_shard
 from tqdm import tqdm
 
-from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
 from cosmos_predict2.conditioner import DataType, TextCondition
+from cosmos_predict2.configs.base.config_text2image import Text2ImagePipelineConfig
 from cosmos_predict2.datasets.utils import IMAGE_RES_SIZE_INFO
 from cosmos_predict2.models.text2image_dit import MiniTrainDIT
 from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
@@ -35,6 +35,7 @@ from cosmos_predict2.pipelines.base import BasePipeline
 from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
 from cosmos_predict2.tokenizers.tokenizer import TokenizerInterface
 from cosmos_predict2.utils.dtensor_helper import DTensorFastEmaModelUpdater, broadcast_dtensor_model_states
+from imaginaire.auxiliary.text_encoder import CosmosTextEncoder, get_cosmos_text_encoder
 from imaginaire.lazy_config import LazyDict, instantiate
 from imaginaire.utils import log, misc
 from imaginaire.utils.ema import FastEmaModelUpdater
@@ -71,7 +72,7 @@ def get_sample_batch(
 class Text2ImagePipeline(BasePipeline):
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
-        self.text_encoder: CosmosT5TextEncoder = None
+        self.text_encoder: CosmosTextEncoder = None
         self.dit: MiniTrainDIT = None
         self.dit_ema: torch.nn.Module = None
         self.tokenizer: TokenizerInterface = None
@@ -84,9 +85,9 @@ class Text2ImagePipeline(BasePipeline):
 
     @staticmethod
     def from_config(
-        config: LazyDict,
+        config: LazyDict[Text2ImagePipelineConfig],
         dit_path: str = "",
-        text_encoder_path: str = "",
+        use_text_encoder: bool = True,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
@@ -119,24 +120,21 @@ class Text2ImagePipeline(BasePipeline):
 
         # 3. Set up tokenizer
         pipe.tokenizer = instantiate(config.tokenizer)
-        assert (
-            pipe.tokenizer.latent_ch == pipe.config.state_ch
-        ), f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+            f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        )
 
         # 4. Load text encoder
-        if text_encoder_path:
-            # inference
-            pipe.text_encoder = CosmosT5TextEncoder(device=device, cache_dir=text_encoder_path)
-            pipe.text_encoder.to(device)
+        if use_text_encoder:
+            pipe.text_encoder = get_cosmos_text_encoder(config=config.text_encoder, device=device)
         else:
-            # training
             pipe.text_encoder = None
 
         # 5. Initialize conditioner
         pipe.conditioner = instantiate(config.conditioner)
-        assert (
-            sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0
-        ), "conditioner should not have learnable parameters"
+        assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+            "conditioner should not have learnable parameters"
+        )
 
         if config.guardrail_config.enabled:
             from cosmos_predict2.auxiliary.guardrail.common import presets as guardrail_presets
@@ -215,26 +213,21 @@ class Text2ImagePipeline(BasePipeline):
     def denoising_model(self) -> MiniTrainDIT:
         return self.dit
 
-    def encode_prompt(
-        self, prompts: Union[str, List[str]], max_length: int = 512, return_mask: bool = False
-    ) -> torch.Tensor:
-        if isinstance(prompts, str):
-            prompts = [prompts]
-
+    def encode_prompt(self, prompts: str | list[str], max_length: int = 512, return_mask: bool = False) -> torch.Tensor:
         return self.text_encoder.encode_prompts(prompts, max_length=max_length, return_mask=return_mask)  # type: ignore
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         return self.tokenizer.decode(latent / self.sigma_data)
 
-    def _augment_image_dim_inplace(self, data_batch: dict, input_key: str = None) -> None:
+    def _augment_image_dim_inplace(self, data_batch: dict, input_key: str = None) -> None:  # noqa: RUF013
         input_key = "images"
         if input_key in data_batch:
             # Check if the data has already been augmented and avoid re-augmenting
             if IS_PREPROCESSED_KEY in data_batch and data_batch[IS_PREPROCESSED_KEY] is True:
-                assert (
-                    data_batch[input_key].shape[2] == 1
-                ), f"Image data is claimed be augmented while its shape is {data_batch[input_key].shape}"
+                assert data_batch[input_key].shape[2] == 1, (
+                    f"Image data is claimed be augmented while its shape is {data_batch[input_key].shape}"
+                )
                 return
             else:
                 data_batch[input_key] = rearrange(data_batch[input_key], "b c h w -> b c 1 h w").contiguous()
@@ -256,7 +249,7 @@ class Text2ImagePipeline(BasePipeline):
         condition: torch.Tensor,
         epsilon_B_C_T_H_W: torch.Tensor,
         sigma_B_T: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Broadcast and split the input data and condition for model parallelism.
         Currently, we only support context parallelism, but it's disabled for text2image.
@@ -267,7 +260,7 @@ class Text2ImagePipeline(BasePipeline):
 
     def get_data_and_condition(
         self, data_batch: dict[str, torch.Tensor]
-    ) -> Tuple[torch.Tensor, torch.Tensor, TextCondition]:
+    ) -> tuple[torch.Tensor, torch.Tensor, TextCondition]:
         self._augment_image_dim_inplace(data_batch)
 
         # Latent state
@@ -385,7 +378,7 @@ class Text2ImagePipeline(BasePipeline):
 
         x_sigma_max = (
             misc.arch_invariant_rand(
-                (n_sample,) + tuple(state_shape),
+                (n_sample,) + tuple(state_shape),  # noqa: RUF005
                 torch.float32,
                 self.tensor_kwargs["device"],
                 seed,

@@ -20,7 +20,8 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 
-from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
+from imaginaire.auxiliary.text_encoder import CosmosT5TextEncoder, CosmosT5TextEncoderConfig
+from imaginaire.constants import T5_MODEL_DIR
 
 """example command
 python -m scripts.get_t5_embeddings_from_groot_dataset --dataset_path datasets/benchmark_train/gr1
@@ -36,9 +37,7 @@ def parse_args() -> argparse.ArgumentParser:
         "--prompt_prefix", type=str, default="The robot arm is performing a task. ", help="Prefix of the prompt"
     )
     parser.add_argument("--max_length", type=int, default=512, help="Maximum length of the text embedding")
-    parser.add_argument(
-        "--cache_dir", type=str, default="checkpoints/google-t5/t5-11b", help="Directory to cache the T5 model"
-    )
+    parser.add_argument("--cache_dir", type=str, default=T5_MODEL_DIR, help="Directory to cache the T5 model")
     parser.add_argument(
         "--meta_csv", type=str, default="datasets/benchmark_train/gr1/metadata.csv", help="Metadata csv file"
     )
@@ -47,14 +46,15 @@ def parse_args() -> argparse.ArgumentParser:
 
 def main(args) -> None:
     meta_csv = args.meta_csv
-    meta_lines = open(meta_csv, "r").readlines()[1:]
+    meta_lines = open(meta_csv).readlines()[1:]
     t5_xxl_dir = os.path.join(args.dataset_path, "t5_xxl")
     os.makedirs(t5_xxl_dir, exist_ok=True)
     meta_txt_dir = os.path.join(args.dataset_path, "metas")
     os.makedirs(meta_txt_dir, exist_ok=True)
 
     # Initialize T5
-    encoder = CosmosT5TextEncoder(cache_dir=args.cache_dir, local_files_only=True)
+    encoder_config = CosmosT5TextEncoderConfig(ckpt_path=args.cache_dir)
+    encoder = CosmosT5TextEncoder(config=encoder_config)
 
     for meta_line in tqdm(meta_lines):
         video_filename, prompt = meta_line.split(",", 1)

@@ -26,10 +26,17 @@ from megatron.core import parallel_state
 from tqdm import tqdm
 
 from cosmos_predict2.configs.base.config_video2world import (
-    PREDICT2_VIDEO2WORLD_PIPELINE_2B,
-    PREDICT2_VIDEO2WORLD_PIPELINE_14B,
+    Video2WorldPipelineConfig,
+    get_cosmos_predict2_video2world_pipeline,
 )
 from cosmos_predict2.pipelines.video2world import _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS, Video2WorldPipeline
+from imaginaire.auxiliary.text_encoder import CosmosTextEncoder, get_cosmos_text_encoder
+from imaginaire.constants import (
+    CosmosPredict2Video2WorldFPS,
+    CosmosPredict2Video2WorldModelSize,
+    CosmosPredict2Video2WorldResolution,
+    get_cosmos_predict2_video2world_checkpoint,
+)
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
 
@@ -68,7 +75,9 @@ def add_lora_to_model(
     return model
 
 
-def setup_lora_pipeline(config, dit_path, text_encoder_path, args):
+def setup_lora_pipeline(
+    config: Video2WorldPipelineConfig, dit_path: str, use_text_encoder: bool, args: argparse.Namespace
+):
     """
     Set up a pipeline with LoRA support.
     This function creates the pipeline, adds LoRA, then loads the checkpoint.
@@ -76,7 +85,6 @@ def setup_lora_pipeline(config, dit_path, text_encoder_path, args):
     import numpy as np
 
     from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
-    from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
     from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
     from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
     from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
@@ -108,22 +116,19 @@ def setup_lora_pipeline(config, dit_path, text_encoder_path, args):
     )
     # 3. Set up tokenizer
     pipe.tokenizer = instantiate(config.tokenizer)
-    assert (
-        pipe.tokenizer.latent_ch == pipe.config.state_ch
-    ), f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+    assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+        f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+    )
     # 4. Load text encoder
-    if text_encoder_path:
-        # inference
-        pipe.text_encoder = CosmosT5TextEncoder(device="cuda", cache_dir=text_encoder_path)
-        pipe.text_encoder.to("cuda")
+    if use_text_encoder:
+        pipe.text_encoder = get_cosmos_text_encoder(config=config.text_encoder, device="cuda")
     else:
-        # training
         pipe.text_encoder = None
     # 5. Initialize conditioner
     pipe.conditioner = instantiate(config.conditioner)
-    assert (
-        sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0
-    ), "conditioner should not have learnable parameters"
+    assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+        "conditioner should not have learnable parameters"
+    )
     # Load prompt refiner
     pipe.prompt_refiner = CosmosReason1(
         checkpoint_dir=config.prompt_refiner_config.checkpoint_dir,
@@ -225,7 +230,7 @@ def setup_lora_pipeline(config, dit_path, text_encoder_path, args):
     trainable_params = sum(p.numel() for p in pipe.dit.parameters() if p.requires_grad)
     log.info(f"Total parameters: {total_params:,}")
     log.info(f"Trainable LoRA parameters: {trainable_params:,}")
-    log.info(f"LoRA parameter ratio: {trainable_params/total_params*100:.2f}%")
+    log.info(f"LoRA parameter ratio: {trainable_params / total_params * 100:.2f}%")
     return pipe
 
 
@@ -260,20 +265,20 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Video-to-World Generation with Cosmos Predict2 (LoRA Support)")
     parser.add_argument(
         "--model_size",
-        choices=["2B", "14B"],
+        choices=CosmosPredict2Video2WorldModelSize.__args__,
         default="2B",
         help="Size of the model to use for video-to-world generation",
     )
     parser.add_argument(
         "--resolution",
-        choices=["480", "720"],
+        choices=CosmosPredict2Video2WorldResolution.__args__,
         default="720",
         type=str,
         help="Resolution of the model to use for video-to-world generation",
     )
     parser.add_argument(
         "--fps",
-        choices=[10, 16],
+        choices=CosmosPredict2Video2WorldFPS.__args__,
         default=16,
         type=int,
         help="FPS of the model to use for video-to-world generation",
@@ -375,31 +380,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def setup_pipeline(args: argparse.Namespace, text_encoder=None):
-    log.info(f"Using model size: {args.model_size}")
-    if args.model_size == "2B":
-        config = PREDICT2_VIDEO2WORLD_PIPELINE_2B
-        config.resolution = args.resolution
-        if args.fps == 10:  # default is 16 so no need to change config
-            config.state_t = 16
-        dit_path = f"checkpoints/nvidia/Cosmos-Predict2-2B-Video2World/model-{args.resolution}p-{args.fps}fps.pt"
-    elif args.model_size == "14B":
-        config = PREDICT2_VIDEO2WORLD_PIPELINE_14B
-        config.resolution = args.resolution
-        if args.fps == 10:  # default is 16 so no need to change config
-            config.state_t = 16
-        dit_path = f"checkpoints/nvidia/Cosmos-Predict2-14B-Video2World/model-{args.resolution}p-{args.fps}fps.pt"
-    else:
-        raise ValueError("Invalid model size. Choose either '2B' or '14B'.")
+def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | None = None):
+    config = get_cosmos_predict2_video2world_pipeline(
+        model_size=args.model_size, resolution=args.resolution, fps=args.fps
+    )
     if hasattr(args, "dit_path") and args.dit_path:
         dit_path = args.dit_path
-    # Only set up text encoder path if no encoder is provided
-    text_encoder_path = None if text_encoder is not None else "checkpoints/google-t5/t5-11b"
-    log.info(f"Using dit_path: {dit_path}")
-    if text_encoder is not None:
-        log.info("Using provided text encoder")
     else:
-        log.info(f"Using text encoder from: {text_encoder_path}")
+        dit_path = get_cosmos_predict2_video2world_checkpoint(
+            model_size=args.model_size, resolution=args.resolution, fps=args.fps
+        )
     misc.set_random_seed(seed=args.seed, by_rank=True)
     # Initialize cuDNN.
     torch.backends.cudnn.deterministic = False
@@ -439,13 +429,13 @@ def setup_pipeline(args: argparse.Namespace, text_encoder=None):
     if args.use_lora:
         # For LoRA inference, we need to add LoRA before loading the checkpoint
         log.info("LoRA inference mode detected - using custom pipeline loading")
-        pipe = setup_lora_pipeline(config, dit_path, text_encoder_path, args)
+        pipe = setup_lora_pipeline(config=config, dit_path=dit_path, use_text_encoder=text_encoder is None, args=args)
     else:
         # Standard inference
         pipe = Video2WorldPipeline.from_config(
             config=config,
             dit_path=dit_path,
-            text_encoder_path=text_encoder_path,
+            use_text_encoder=text_encoder is None,
             device="cuda",
             torch_dtype=torch.bfloat16,
             load_prompt_refiner=True,
@@ -508,7 +498,7 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
     if args.batch_input_json is not None:
         # Process batch inputs from JSON file
         log.info(f"Loading batch inputs from JSON file: {args.batch_input_json}")
-        with open(args.batch_input_json, "r") as f:
+        with open(args.batch_input_json) as f:
             batch_inputs = json.load(f)
         for idx, item in enumerate(tqdm(batch_inputs)):
             input_video = item.get("input_video", "")

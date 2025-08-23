@@ -15,7 +15,6 @@
 
 from collections import namedtuple
 from collections.abc import Mapping, Sequence
-from typing import Optional
 
 import torch
 from torch import nn
@@ -53,7 +52,7 @@ ALLOWED_COMPUTE_CAPS = [90, 100]
 
 class NeighborhoodAttention(nn.Module):
     def __init__(self, natten_parameters, base_attn_op):
-        super(NeighborhoodAttention, self).__init__()
+        super(NeighborhoodAttention, self).__init__()  # noqa: UP008
 
         self.base_attn_op = base_attn_op
 
@@ -69,29 +68,27 @@ class NeighborhoodAttention(nn.Module):
         self.is_causal = False if "is_causal" not in natten_parameters else natten_parameters["is_causal"]
 
         if not isinstance(self.window_size, Sequence) or len(self.window_size) != 3:
-            raise ValueError("Invalid window_size value. Expected an iterable of length 3, got " f"{self.window_size}.")
+            raise ValueError(f"Invalid window_size value. Expected an iterable of length 3, got {self.window_size}.")
 
         if (not isinstance(self.stride, Sequence) or len(self.stride) != 3) and not isinstance(self.stride, int):
-            raise ValueError(
-                "Invalid stride value. Expected an iterable of length 3, or integer, got " f"{self.stride}."
-            )
+            raise ValueError(f"Invalid stride value. Expected an iterable of length 3, or integer, got {self.stride}.")
 
         if (not isinstance(self.dilation, Sequence) or len(self.dilation) != 3) and not isinstance(self.dilation, int):
             raise ValueError(
-                "Invalid dilation value. Expected an iterable of length 3, or integer, got " f"{self.dilation}."
+                f"Invalid dilation value. Expected an iterable of length 3, or integer, got {self.dilation}."
             )
 
         if (not isinstance(self.is_causal, Sequence) or len(self.is_causal) != 3) and not isinstance(
             self.is_causal, bool
         ):
             raise ValueError(
-                "Invalid is_causal value. Expected an iterable of length 3, or boolean, got " f"{self.is_causal}."
+                f"Invalid is_causal value. Expected an iterable of length 3, or boolean, got {self.is_causal}."
             )
 
         self.base_size = None if "base_size" not in natten_parameters else natten_parameters["base_size"]
         if self.base_size is not None and (not isinstance(self.base_size, Sequence) or len(self.base_size) != 3):
             raise ValueError(
-                "Invalid base feature map size. Expected an iterable of length 3, or None, got " f"{self.base_size}."
+                f"Invalid base feature map size. Expected an iterable of length 3, or None, got {self.base_size}."
             )
 
         # Configurations
@@ -127,7 +124,7 @@ class NeighborhoodAttention(nn.Module):
         }
 
     def get_adaptive_parameters(self, window_size, stride, dilation, is_causal, input_shape, base_size=None):
-        window_size = tuple(w if w > 1 else x for x, w in zip(input_shape, window_size))
+        window_size = tuple(w if w > 1 else x for x, w in zip(input_shape, window_size, strict=False))
         stride = tuple(stride for _ in range(3)) if isinstance(stride, int) else tuple(x for x in stride)
         dilation = tuple(dilation for _ in range(3)) if isinstance(dilation, int) else tuple(x for x in dilation)
         is_causal = tuple(is_causal for _ in range(3)) if isinstance(is_causal, bool) else tuple(x for x in is_causal)
@@ -137,24 +134,28 @@ class NeighborhoodAttention(nn.Module):
         # input/feature map size of (16, 16, 16); then if the input feat map in this iteration
         # has shape (8, 8, 8), we should use window size (4, 4, 4), and stride (1, 1, 1).
         if base_size is not None:
-            base_shape = tuple(b if b > 0 else x for x, b in zip(input_shape, base_size))
+            base_shape = tuple(b if b > 0 else x for x, b in zip(input_shape, base_size, strict=False))
 
-            scale = tuple(x / b for x, b in zip(input_shape, base_shape))
+            scale = tuple(x / b for x, b in zip(input_shape, base_shape, strict=False))
 
-            scaled_window_size = tuple(min(max(2, round(w * s)), x) for w, s, x in zip(window_size, scale, input_shape))
-            scaled_stride = tuple(min(max(1, round(st * s)), w) for w, s, st in zip(scaled_window_size, scale, stride))
+            scaled_window_size = tuple(
+                min(max(2, round(w * s)), x) for w, s, x in zip(window_size, scale, input_shape, strict=False)
+            )
+            scaled_stride = tuple(
+                min(max(1, round(st * s)), w) for w, s, st in zip(scaled_window_size, scale, stride, strict=False)
+            )
 
-            max_dilation = tuple(x // w for x, w in zip(input_shape, scaled_window_size))
+            max_dilation = tuple(x // w for x, w in zip(input_shape, scaled_window_size, strict=False))
             scaled_dilation = tuple(
-                min(max(1, round(d * s)), max_d) for d, s, max_d in zip(dilation, scale, max_dilation)
+                min(max(1, round(d * s)), max_d) for d, s, max_d in zip(dilation, scale, max_dilation, strict=False)
             )
 
             window_size = scaled_window_size
             stride = scaled_stride
             dilation = scaled_dilation
 
-        assert all(x >= w * d for x, w, d in zip(input_shape, window_size, dilation))
-        assert all(w >= s for w, s in zip(window_size, stride))
+        assert all(x >= w * d for x, w, d in zip(input_shape, window_size, dilation, strict=False))
+        assert all(w >= s for w, s in zip(window_size, stride, strict=False))
         assert all(isinstance(c, bool) for c in is_causal)
 
         return window_size, stride, dilation, is_causal
@@ -164,12 +165,11 @@ class NeighborhoodAttention(nn.Module):
         q_B_L_H_D: torch.Tensor,
         k_B_L_H_D: torch.Tensor,
         v_B_L_H_D: torch.Tensor,
-        video_size: Optional[VideoSize] = None,
+        video_size: VideoSize | None = None,
     ):
         if not (q_B_L_H_D.shape == k_B_L_H_D.shape == v_B_L_H_D.shape):
             raise ValueError(
-                "NATTEN requires QKV shapes to match, got "
-                f"{q_B_L_H_D.shape=}, {k_B_L_H_D.shape=}, {v_B_L_H_D.shape=}."
+                f"NATTEN requires QKV shapes to match, got {q_B_L_H_D.shape=}, {k_B_L_H_D.shape=}, {v_B_L_H_D.shape=}."
             )
 
         device = q_B_L_H_D.device
@@ -178,7 +178,7 @@ class NeighborhoodAttention(nn.Module):
         is_cuda = torch.cuda.is_available() and torch.version.cuda and device.type == "cuda"
 
         if not is_cuda:
-            raise NotImplementedError("Cosmos-Predict2 + NATTEN requires CUDA, tensors were on " f"{device=}.")
+            raise NotImplementedError(f"Cosmos-Predict2 + NATTEN requires CUDA, tensors were on {device=}.")
 
         if compute_cap not in ALLOWED_COMPUTE_CAPS:
             raise NotImplementedError(
@@ -199,7 +199,7 @@ class NeighborhoodAttention(nn.Module):
         T, H, W = video_size
 
         if seqlen != T * H * W:
-            raise ValueError("Mismatch between seqlen and video_size dimensions; got " f"{video_size=}, {seqlen=}.")
+            raise ValueError(f"Mismatch between seqlen and video_size dimensions; got {video_size=}, {seqlen=}.")
 
         if T > 1:
             input_shape = (T, H, W)

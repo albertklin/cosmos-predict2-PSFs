@@ -15,10 +15,10 @@
 
 import collections
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any
 
 import numpy as np
 import torch
@@ -40,6 +40,7 @@ from cosmos_predict2.module.neighborhood_attn import NeighborhoodAttention
 from cosmos_predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_predict2.networks.selective_activation_checkpoint import SACConfig as _SACConfig
 from cosmos_predict2.utils.context_parallel import split_inputs_cp
+from imaginaire.constants import TEXT_ENCODER_CLASS, TextEncoderClass
 from imaginaire.utils import log
 from imaginaire.utils.graph import create_cuda_graph
 
@@ -256,13 +257,13 @@ class Attention(nn.Module):
     def __init__(
         self,
         query_dim: int,
-        context_dim: Optional[int] = None,
+        context_dim: int | None = None,
         n_heads: int = 8,
         head_dim: int = 64,
         dropout: float = 0.0,
         qkv_format: str = "bshd",
         backend: str = "transformer_engine",
-        natten_params: Optional[Mapping] = None,
+        natten_params: Mapping | None = None,
     ) -> None:
         super().__init__()
         log.debug(
@@ -340,8 +341,8 @@ class Attention(nn.Module):
     def compute_qkv(
         self,
         x: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
-        rope_emb: Optional[torch.Tensor] = None,
+        context: torch.Tensor | None = None,
+        rope_emb: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q = self.q_proj(x)
         context = x if context is None else context
@@ -353,8 +354,8 @@ class Attention(nn.Module):
         )
 
         def apply_norm_and_rotary_pos_emb(
-            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rope_emb: Optional[torch.Tensor]
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rope_emb: torch.Tensor | None
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
             q = self.q_norm(q)
             k = self.k_norm(k)
             v = self.v_norm(v)
@@ -368,7 +369,7 @@ class Attention(nn.Module):
         return q, k, v
 
     def compute_attention(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, video_size: Optional[VideoSize] = None
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, video_size: VideoSize | None = None
     ) -> torch.Tensor:
         additional_args = {}
         if isinstance(self.attn_op, (NattenA2AAttnOp, NeighborhoodAttention)):
@@ -380,9 +381,9 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
-        rope_emb: Optional[torch.Tensor] = None,
-        video_size: Optional[VideoSize] = None,
+        context: torch.Tensor | None = None,
+        rope_emb: torch.Tensor | None = None,
+        video_size: VideoSize | None = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -395,7 +396,7 @@ class Attention(nn.Module):
         return self.compute_attention(q, k, v, video_size=video_size)
 
     def set_context_parallel_group(
-        self, process_group: ProcessGroup, ranks: List[int], stream: torch.cuda.Stream
+        self, process_group: ProcessGroup, ranks: list[int], stream: torch.cuda.Stream
     ) -> None:
         self.attn_op.set_context_parallel_group(process_group, ranks, stream)
 
@@ -415,7 +416,7 @@ class VideoPositionEmb(nn.Module):
     def seq_dim(self) -> int:
         return 1
 
-    def forward(self, x_B_T_H_W_C: torch.Tensor, fps: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, x_B_T_H_W_C: torch.Tensor, fps: torch.Tensor | None) -> torch.Tensor:
         """
         With CP, the function assume that the input tensor is already split.
         It delegates the embedding generation to generate_embeddings function.
@@ -430,7 +431,7 @@ class VideoPositionEmb(nn.Module):
 
         return self._split_for_context_parallel(embeddings)
 
-    def generate_embeddings(self, B_T_H_W_C: torch.Size, fps: Optional[torch.Tensor]) -> Any:
+    def generate_embeddings(self, B_T_H_W_C: torch.Size, fps: torch.Tensor | None) -> Any:
         raise NotImplementedError
 
     def _split_for_context_parallel(self, embeddings: torch.Tensor) -> torch.Tensor:
@@ -500,10 +501,10 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
     def generate_embeddings(
         self,
         B_T_H_W_C: torch.Size,
-        fps: Optional[torch.Tensor] = None,
-        h_ntk_factor: Optional[float] = None,
-        w_ntk_factor: Optional[float] = None,
-        t_ntk_factor: Optional[float] = None,
+        fps: torch.Tensor | None = None,
+        h_ntk_factor: float | None = None,
+        w_ntk_factor: float | None = None,
+        t_ntk_factor: float | None = None,
     ) -> torch.Tensor:
         """
         Generate embeddings for the given input size.
@@ -531,17 +532,17 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         temporal_freqs = 1.0 / (t_theta**self.dim_temporal_range)
 
         B, T, H, W, _ = B_T_H_W_C
-        assert (
-            H <= self.max_h and W <= self.max_w
-        ), f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
+        assert H <= self.max_h and W <= self.max_w, (
+            f"Input dimensions (H={H}, W={W}) exceed the maximum dimensions (max_h={self.max_h}, max_w={self.max_w})"
+        )
         half_emb_h = torch.outer(self.seq[:H], h_spatial_freqs)
         half_emb_w = torch.outer(self.seq[:W], w_spatial_freqs)
 
         if self.enable_fps_modulation:
             uniform_fps = (fps is None) or (fps.min() == fps.max())
-            assert (
-                uniform_fps or B == 1 or T == 1
-            ), "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
+            assert uniform_fps or B == 1 or T == 1, (
+                "For video batch, batch size should be 1 for non-uniform fps. For image batch, T should be 1"
+            )
 
             # apply sequence scaling in temporal dimension
             if fps is None:  # image case
@@ -602,7 +603,7 @@ class LearnablePosEmbAxis(VideoPositionEmb):
         torch.nn.init.trunc_normal_(self.pos_emb_w, std=std, a=-3 * std, b=3 * std)
         torch.nn.init.trunc_normal_(self.pos_emb_t, std=std, a=-3 * std, b=3 * std)
 
-    def generate_embeddings(self, B_T_H_W_C: torch.Size, fps: Optional[torch.Tensor]) -> torch.Tensor:
+    def generate_embeddings(self, B_T_H_W_C: torch.Size, fps: torch.Tensor | None) -> torch.Tensor:
         B, T, H, W, _ = B_T_H_W_C
         if self.interpolation == "crop":
             emb_h_H = self.pos_emb_h[:H]
@@ -670,7 +671,7 @@ class TimestepEmbedding(nn.Module):
         std = 1.0 / math.sqrt(self.out_dim)
         torch.nn.init.trunc_normal_(self.linear_2.weight, std=std, a=-3 * std, b=3 * std)
 
-    def forward(self, sample: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def forward(self, sample: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         emb = self.linear_1(sample)
         emb = self.activation(emb)
         emb = self.linear_2(emb)
@@ -802,9 +803,9 @@ class PatchEmbed(nn.Module):
         """
         assert x.dim() == 5
         _, _, T, H, W = x.shape
-        assert (
-            H % self.spatial_patch_size == 0 and W % self.spatial_patch_size == 0
-        ), f"H,W {(H, W)} should be divisible by spatial_patch_size {self.spatial_patch_size}"
+        assert H % self.spatial_patch_size == 0 and W % self.spatial_patch_size == 0, (
+            f"H,W {(H, W)} should be divisible by spatial_patch_size {self.spatial_patch_size}"
+        )
         assert T % self.temporal_patch_size == 0
         x = self.proj(x)
         return x
@@ -861,7 +862,7 @@ class FinalLayer(nn.Module):
         self,
         x_B_T_H_W_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
-        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
+        adaln_lora_B_T_3D: torch.Tensor | None = None,
     ):
         if self.use_adaln_lora:
             assert adaln_lora_B_T_3D is not None
@@ -871,8 +872,9 @@ class FinalLayer(nn.Module):
         else:
             shift_B_T_D, scale_B_T_D = self.adaln_modulation(emb_B_T_D).chunk(2, dim=-1)
 
-        shift_B_T_1_1_D, scale_B_T_1_1_D = rearrange(shift_B_T_D, "b t d -> b t 1 1 d"), rearrange(
-            scale_B_T_D, "b t d -> b t 1 1 d"
+        shift_B_T_1_1_D, scale_B_T_1_1_D = (
+            rearrange(shift_B_T_D, "b t d -> b t 1 1 d"),
+            rearrange(scale_B_T_D, "b t d -> b t 1 1 d"),
         )
 
         def _fn(
@@ -919,7 +921,7 @@ class Block(nn.Module):
         adaln_lora_dim: int = 256,
         self_attention_backend: str = "transformer_engine",
         cross_attention_backend: str = "transformer_engine",
-        natten_params: Optional[Mapping] = None,
+        natten_params: Mapping | None = None,
     ):
         super().__init__()
         self.x_dim = x_dim
@@ -1003,9 +1005,9 @@ class Block(nn.Module):
         x_B_T_H_W_D: torch.Tensor,
         emb_B_T_D: torch.Tensor,
         crossattn_emb: torch.Tensor,
-        rope_emb_L_1_1_D: Optional[torch.Tensor] = None,
-        adaln_lora_B_T_3D: Optional[torch.Tensor] = None,
-        extra_per_block_pos_emb: Optional[torch.Tensor] = None,
+        rope_emb_L_1_1_D: torch.Tensor | None = None,
+        adaln_lora_B_T_3D: torch.Tensor | None = None,
+        extra_per_block_pos_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if extra_per_block_pos_emb is not None:
             x_B_T_H_W_D = x_B_T_H_W_D + extra_per_block_pos_emb
@@ -1173,6 +1175,8 @@ class MiniTrainDIT(WeightTrainingStat):
         atten_backend: str = "transformer_engine",
         # cross attention settings
         crossattn_emb_channels: int = 1024,
+        use_crossattn_projection: bool = TEXT_ENCODER_CLASS is TextEncoderClass.COSMOS_REASON1,
+        crossattn_proj_in_channels: int = 100352,
         # positional embedding settings
         pos_emb_cls: str = "sincos",
         pos_emb_learnable: bool = False,
@@ -1189,8 +1193,8 @@ class MiniTrainDIT(WeightTrainingStat):
         extra_w_extrapolation_ratio: float = 1.0,
         extra_t_extrapolation_ratio: float = 1.0,
         rope_enable_fps_modulation: bool = True,
-        sac_config: SACConfig = SACConfig(),
-        natten_parameters: Union[dict, list] = None,
+        sac_config: SACConfig = SACConfig(),  # noqa: B008
+        natten_parameters: dict | list = None,  # noqa: RUF013
     ) -> None:
         super().__init__()
         self.max_img_h = max_img_h
@@ -1278,6 +1282,14 @@ class MiniTrainDIT(WeightTrainingStat):
             adaln_lora_dim=self.adaln_lora_dim,
         )
 
+        if use_crossattn_projection:
+            self.crossattn_proj = nn.Sequential(
+                nn.Linear(crossattn_proj_in_channels, crossattn_emb_channels, bias=True),
+                nn.GELU(),
+            )
+        else:
+            self.crossattn_proj = None
+
         self.t_embedding_norm = te.pytorch.RMSNorm(model_channels, eps=1e-6)
         self.init_weights()
         self.enable_selective_checkpoint(sac_config)
@@ -1355,9 +1367,9 @@ class MiniTrainDIT(WeightTrainingStat):
     def prepare_embedded_sequence(
         self,
         x_B_C_T_H_W: torch.Tensor,
-        fps: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        fps: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         """
         Prepares an embedded sequence tensor by applying positional embeddings and handling padding masks.
 
@@ -1417,26 +1429,29 @@ class MiniTrainDIT(WeightTrainingStat):
         x_B_C_T_H_W: torch.Tensor,
         timesteps_B_T: torch.Tensor,
         crossattn_emb: torch.Tensor,
-        fps: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-        data_type: Optional[DataType] = DataType.VIDEO,
+        fps: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        data_type: DataType | None = DataType.VIDEO,
         use_cuda_graphs: bool = False,
-    ) -> torch.Tensor | List[torch.Tensor] | Tuple[torch.Tensor, List[torch.Tensor]]:
+    ) -> torch.Tensor | list[torch.Tensor] | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
             x: (B, C, T, H, W) tensor of spatial-temp inputs
             timesteps: (B, ) tensor of timesteps
             crossattn_emb: (B, N, D) tensor of cross-attention embeddings
         """
-        assert isinstance(
-            data_type, DataType
-        ), f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
+        assert isinstance(data_type, DataType), (
+            f"Expected DataType, got {type(data_type)}. We need discuss this flag later."
+        )
         assert not (self.training and use_cuda_graphs), "CUDA Graphs are supported only for inference"
         x_B_T_H_W_D, rope_emb_L_1_1_D, extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D = self.prepare_embedded_sequence(
             x_B_C_T_H_W,
             fps=fps,
             padding_mask=padding_mask,
         )
+
+        if self.crossattn_proj is not None:
+            crossattn_emb = self.crossattn_proj(crossattn_emb)
 
         if timesteps_B_T.ndim == 1:
             timesteps_B_T = timesteps_B_T.unsqueeze(1)
@@ -1451,9 +1466,9 @@ class MiniTrainDIT(WeightTrainingStat):
         self.crossattn_emb = crossattn_emb
 
         if extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D is not None:
-            assert (
-                x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape
-            ), f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
+            assert x_B_T_H_W_D.shape == extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape, (
+                f"{x_B_T_H_W_D.shape} != {extra_pos_emb_B_T_H_W_D_or_T_H_W_B_D.shape}"
+            )
 
         if use_cuda_graphs:
             shapes_key = create_cuda_graph(
@@ -1541,7 +1556,7 @@ class MiniTrainDIT(WeightTrainingStat):
 
         self._is_context_parallel_enabled = False
 
-    def enable_context_parallel(self, process_group: Optional[ProcessGroup] = None) -> None:
+    def enable_context_parallel(self, process_group: ProcessGroup | None = None) -> None:
         # pos_embedder
         self.pos_embedder.enable_context_parallel(process_group=process_group)
         if self.extra_per_block_abs_pos_emb:

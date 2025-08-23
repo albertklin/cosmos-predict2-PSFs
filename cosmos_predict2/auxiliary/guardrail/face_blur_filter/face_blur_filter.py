@@ -33,6 +33,7 @@ from cosmos_predict2.auxiliary.guardrail.face_blur_filter.retinaface_utils impor
     filter_detected_boxes,
     load_model,
 )
+from imaginaire.constants import COSMOS_GUARDRAIL1_MODEL_DIR
 from imaginaire.utils import log, misc
 
 # RetinaFace model constants from https://github.com/biubug6/Pytorch_Retinaface/blob/master/detect.py
@@ -217,9 +218,7 @@ def main(args):
         log.error(f"No video files found in directory: {args.input_dir}")
         return
 
-    face_blur = RetinaFaceFilter(
-        checkpoint_dir="checkpoints/nvidia/Cosmos-Guardrail1/face_blur_filter/Resnet50_Final.pth"
-    )
+    face_blur = RetinaFaceFilter(checkpoint_dir=f"{COSMOS_GUARDRAIL1_MODEL_DIR}/face_blur_filter/Resnet50_Final.pth")
     postprocessing_runner = GuardrailRunner(postprocessors=[face_blur])
     os.makedirs(args.output_dir, exist_ok=True)
 

@@ -16,7 +16,7 @@
 import argparse
 import json
 import os
-from typing import Iterable, Tuple, Union
+from collections.abc import Iterable
 
 import torch
 from PIL import Image
@@ -25,6 +25,7 @@ from cosmos_predict2.auxiliary.guardrail.common.core import ContentSafetyGuardra
 from cosmos_predict2.auxiliary.guardrail.common.io_utils import get_video_filepaths, read_video
 from cosmos_predict2.auxiliary.guardrail.video_content_safety_filter.model import ModelConfig, VideoSafetyModel
 from cosmos_predict2.auxiliary.guardrail.video_content_safety_filter.vision_encoder import SigLIPEncoder
+from imaginaire.constants import COSMOS_GUARDRAIL1_MODEL_DIR
 from imaginaire.utils import log, misc
 
 # Define the class index to class name mapping for multi-class classification
@@ -168,7 +169,7 @@ class VideoContentSafetyFilter(ContentSafetyGuardrail):
         log.debug(f"Frames data: {json.dumps(video_data, indent=4)}")
         return is_safe
 
-    def is_safe(self, input: Union[str, Iterable]) -> Tuple[bool, str]:
+    def is_safe(self, input: str | Iterable) -> tuple[bool, str]:
         if isinstance(input, str):
             is_safe = self.is_safe_file(input)
             return is_safe, "safe video detected" if is_safe else "unsafe video detected"
@@ -191,9 +192,7 @@ def main(args):
         log.error(f"No video files found in directory: {args.input_dir}")
         return
 
-    video_filter = VideoContentSafetyFilter(
-        checkpoint_dir="checkpoints/nvidia/Cosmos-Guardrail1/video_content_safety_filter"
-    )
+    video_filter = VideoContentSafetyFilter(checkpoint_dir=f"{COSMOS_GUARDRAIL1_MODEL_DIR}/video_content_safety_filter")
     runner = GuardrailRunner(safety_models=[video_filter], generic_safe_msg="Video is safe")
 
     for filepath in filepaths:

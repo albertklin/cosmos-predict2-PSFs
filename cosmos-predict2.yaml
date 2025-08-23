@@ -1,8 +1,0 @@
-name: cosmos-predict2
-channels:
-  - conda-forge
-dependencies:
-  - python=3.10
-  - clang=20.1.8
-  - cuda=12.6
-  - libgl=1.7.0

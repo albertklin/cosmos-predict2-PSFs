@@ -19,7 +19,8 @@ import pickle
 
 import numpy as np
 
-from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
+from imaginaire.auxiliary.text_encoder import CosmosT5TextEncoder, CosmosT5TextEncoderConfig
+from imaginaire.constants import T5_MODEL_DIR
 
 """example command
 python -m scripts.get_t5_embeddings --dataset_path datasets/hdvila
@@ -30,9 +31,7 @@ def parse_args() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Compute T5 embeddings for text prompts")
     parser.add_argument("--dataset_path", type=str, default="datasets/hdvila", help="Root path to the dataset")
     parser.add_argument("--max_length", type=int, default=512, help="Maximum length of the text embedding")
-    parser.add_argument(
-        "--cache_dir", type=str, default="checkpoints/google-t5/t5-11b", help="Directory to cache the T5 model"
-    )
+    parser.add_argument("--cache_dir", type=str, default=T5_MODEL_DIR, help="Directory to cache the T5 model")
     return parser.parse_args()
 
 
@@ -46,7 +45,8 @@ def main(args) -> None:
     os.makedirs(t5_xxl_dir, exist_ok=True)
 
     # Initialize T5
-    encoder = CosmosT5TextEncoder(cache_dir=args.cache_dir, local_files_only=True)
+    encoder_config = CosmosT5TextEncoderConfig(ckpt_path=args.cache_dir)
+    encoder = CosmosT5TextEncoder(config=encoder_config)
 
     for meta_filename in metas_list:
         t5_xxl_filename = os.path.join(t5_xxl_dir, os.path.basename(meta_filename).replace(".txt", ".pickle"))
@@ -54,7 +54,7 @@ def main(args) -> None:
             # Skip if the file already exists
             continue
 
-        with open(meta_filename, "r") as fp:
+        with open(meta_filename) as fp:
             prompt = fp.read().strip()
 
         # Compute T5 embeddings

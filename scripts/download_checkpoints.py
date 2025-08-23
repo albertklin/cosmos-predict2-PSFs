@@ -54,6 +54,7 @@ REPO_ID_MAPPING = {
     "nvidia/Cosmos-Predict2-2B-Multiview": "52f3731663eecdc998d9608f9b21ac4dcbdea6f1",
     "nvidia/Cosmos-Predict2-2B-Text2Image": "acdb5fde992a73ef0355f287977d002cbfd127e0",
     "nvidia/Cosmos-Predict2-2B-Video2World": "f50c09f5d8ab133a90cac3f4886a6471e9ba3f18",
+    "nvidia/Cosmos-Predict2-0.6B-Text2Image": "80e9f1599778499e9b5435179861871b5a3561d4",
     "nvidia/Cosmos-Reason1-7B": "8fe96c1fa10db9e666b6fa6a87fea57dd9635649",
 }
 
@@ -119,6 +120,7 @@ def parse_args():
     args = parser.parse_args()
     return args
 
+
 def main(args):
     # Create local checkpoints folder
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -150,12 +152,15 @@ def main(args):
                     if args.natten and res == "720":
                         allow_patterns.append(f"model-{res}p-{fps}fps-natten.pt")
                     download(
-                        f"nvidia/{MODEL_SIZE_MAPPING[size]}-{MODEL_TYPE_MAPPING['video2world']}", allow_patterns=allow_patterns
+                        f"nvidia/{MODEL_SIZE_MAPPING[size]}-{MODEL_TYPE_MAPPING['video2world']}",
+                        allow_patterns=allow_patterns,
                     )
 
-            download(f"nvidia/{MODEL_SIZE_MAPPING[size]}-{MODEL_TYPE_MAPPING['video2world']}", allow_patterns="tokenizer/*")
+            download(
+                f"nvidia/{MODEL_SIZE_MAPPING[size]}-{MODEL_TYPE_MAPPING['video2world']}", allow_patterns="tokenizer/*"
+            )
         download("nvidia/Cosmos-Reason1-7B")
-    
+
     if "multiview" in args.model_types:
         download("nvidia/Cosmos-Predict2-2B-Multiview", allow_patterns="*.pt")
 
@@ -176,9 +181,7 @@ def main(args):
 
     # Download the guardrail models
     download("nvidia/Cosmos-Guardrail1")
-    download(
-        "meta-llama/Llama-Guard-3-8B", ignore_patterns=["original/*"]
-    )
+    download("meta-llama/Llama-Guard-3-8B", ignore_patterns=["original/*"])
 
     print("Checkpoint downloading done.")
 

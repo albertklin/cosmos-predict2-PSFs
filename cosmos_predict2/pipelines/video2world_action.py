@@ -20,13 +20,13 @@ import torch
 from megatron.core import parallel_state
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
-from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
 from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
 from cosmos_predict2.models.utils import load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
 from cosmos_predict2.utils.context_parallel import cat_outputs_cp, split_inputs_cp
+from imaginaire.auxiliary.text_encoder import get_cosmos_text_encoder
 from imaginaire.lazy_config import instantiate
 from imaginaire.utils import log, misc
 from imaginaire.utils.ema import FastEmaModelUpdater
@@ -45,7 +45,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
     def from_config(
         config: Video2WorldPipelineConfig,
         dit_path: str = "",
-        text_encoder_path: str = "",
+        use_text_encoder: bool = True,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
@@ -80,24 +80,21 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
 
         # 3. Set up tokenizer
         pipe.tokenizer = instantiate(config.tokenizer)
-        assert (
-            pipe.tokenizer.latent_ch == pipe.config.state_ch
-        ), f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+            f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        )
 
         # 4. Load text encoder
-        if text_encoder_path:
-            # inference
-            pipe.text_encoder = CosmosT5TextEncoder(device=device, cache_dir=text_encoder_path)
-            pipe.text_encoder.to(device)
+        if use_text_encoder:
+            pipe.text_encoder = get_cosmos_text_encoder(config=config.text_encoder, device=device)
         else:
-            # training
             pipe.text_encoder = None
 
         # 5. Initialize conditioner
         pipe.conditioner = instantiate(config.conditioner)
-        assert (
-            sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0
-        ), "conditioner should not have learnable parameters"
+        assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+            "conditioner should not have learnable parameters"
+        )
 
         if load_prompt_refiner:
             pipe.prompt_refiner = CosmosReason1(
@@ -138,7 +135,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             state_dict_dit_compatible = dict()
             for k, v in state_dict.items():
                 if k.startswith(prefix_to_load):
-                    state_dict_dit_compatible[k[len(prefix_to_load):]] = v
+                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
                 else:
                     state_dict_dit_compatible[k] = v
             pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
@@ -276,7 +273,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
 
         x_sigma_max = (
             misc.arch_invariant_rand(
-                (n_sample,) + tuple(state_shape),
+                (n_sample,) + tuple(state_shape),  # noqa: RUF005
                 torch.float32,
                 self.tensor_kwargs["device"],
                 seed,
@@ -344,7 +341,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             frames = frames.permute(1, 2, 3, 0).cpu().numpy()  # (T, H, W, C)
 
             # Run guardrail
-            processed_frames = guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)
+            processed_frames = guardrail_presets.run_video_guardrail(frames, self.video_guardrail_runner)  # noqa: F821
             if processed_frames is None:
                 return None
             else:

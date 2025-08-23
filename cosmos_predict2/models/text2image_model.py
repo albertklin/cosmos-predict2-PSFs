@@ -14,7 +14,8 @@
 # limitations under the License.
 
 import collections
-from typing import Any, Dict, Mapping, Optional, Tuple
+from collections.abc import Mapping
+from typing import Any
 
 import attrs
 import torch
@@ -25,12 +26,16 @@ from torch.distributed.tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys
 
 from cosmos_predict2.conditioner import TextCondition
-from cosmos_predict2.configs.base.config_text2image import PREDICT2_TEXT2IMAGE_PIPELINE_2B, Text2ImagePipelineConfig
+from cosmos_predict2.configs.base.config_text2image import (
+    Text2ImagePipelineConfig,
+    get_cosmos_predict2_text2image_pipeline,
+)
 from cosmos_predict2.networks.model_weights_stats import WeightTrainingStat
 from cosmos_predict2.pipelines.text2image import Text2ImagePipeline
 from cosmos_predict2.utils.checkpointer import non_strict_load_model
 from cosmos_predict2.utils.optim_instantiate import get_base_scheduler
 from cosmos_predict2.utils.torch_future import clip_grad_norm_
+from imaginaire.constants import get_cosmos_predict2_text2image_checkpoint
 from imaginaire.lazy_config import LazyDict, instantiate
 from imaginaire.model import ImaginaireModel
 from imaginaire.utils import log
@@ -39,7 +44,7 @@ from imaginaire.utils import log
 @attrs.define(slots=False)
 class Predict2ModelManagerConfig:
     # Local path, use it in fast debug run
-    dit_path: str = "checkpoints/nvidia/Cosmos-Predict2-2B-Text2Image/model.pt"
+    dit_path: str = get_cosmos_predict2_text2image_checkpoint(model_size="2B")
     # For inference
     text_encoder_path: str = ""  # not used in training.
 
@@ -59,9 +64,9 @@ class Predict2Text2ImageModelConfig:
     loss_scale: float = 10.0
 
     # This is used for the original way to load models
-    model_manager_config: Predict2ModelManagerConfig = Predict2ModelManagerConfig()
+    model_manager_config: Predict2ModelManagerConfig = Predict2ModelManagerConfig()  # noqa: RUF009
     # This is a new way to load models
-    pipe_config: Text2ImagePipelineConfig = PREDICT2_TEXT2IMAGE_PIPELINE_2B
+    pipe_config: Text2ImagePipelineConfig = get_cosmos_predict2_text2image_pipeline(model_size="2B")  # noqa: RUF009
     # debug flag
     debug_without_randomness: bool = False
     fsdp_shard_size: int = 0  # 0 means not using fsdp, -1 means set to world size
@@ -156,7 +161,9 @@ class Predict2Text2ImageModel(ImaginaireModel):
 
     # New function, added for i4 adaption
     def init_optimizer_scheduler(
-        self, optimizer_config: LazyDict, scheduler_config: LazyDict
+        self,
+        optimizer_config: LazyDict[torch.optim.Optimizer],
+        scheduler_config: LazyDict[torch.optim.lr_scheduler.LRScheduler],
     ) -> tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LRScheduler]:
         """Creates the optimizer and scheduler for the model.
 
@@ -234,9 +241,9 @@ class Predict2Text2ImageModel(ImaginaireModel):
         """
         is_image = self.input_image_key in data_batch
         is_video = self.input_video_key in data_batch
-        assert (
-            is_image != is_video
-        ), "Only one of the input_image_key or input_video_key should be present in the data_batch."
+        assert is_image != is_video, (
+            "Only one of the input_image_key or input_video_key should be present in the data_batch."
+        )
         return is_image
 
     def _update_train_stats(self, data_batch: dict[str, torch.Tensor]) -> None:
@@ -248,7 +255,7 @@ class Predict2Text2ImageModel(ImaginaireModel):
             else:
                 self.pipe.dit.accum_video_sample_counter += data_batch[input_key].shape[0] * self.data_parallel_size
 
-    def draw_training_sigma_and_epsilon(self, x0_size: torch.Size, condition: Any) -> Tuple[torch.Tensor, torch.Tensor]:
+    def draw_training_sigma_and_epsilon(self, x0_size: torch.Size, condition: Any) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size = x0_size[0]
         epsilon = torch.randn(x0_size, device="cuda")
         sigma_B = self.pipe.scheduler.sample_sigma(batch_size).to(device="cuda")
@@ -272,7 +279,7 @@ class Predict2Text2ImageModel(ImaginaireModel):
         condition: TextCondition,
         epsilon_B_C_T_H_W: torch.Tensor,
         sigma_B_T: torch.Tensor,
-    ) -> Tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Compute loss givee epsilon and sigma
 
@@ -366,7 +373,7 @@ class Predict2Text2ImageModel(ImaginaireModel):
 
     # ------------------ Checkpointing ------------------
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
         # the checkpoint format should be compatible with traditional imaginaire4
         # pipeline contains both net and net_ema
         # checkpoint should be saved/loaded from Model
@@ -456,7 +463,7 @@ class Predict2Text2ImageModel(ImaginaireModel):
         max_norm: float,
         norm_type: float = 2.0,
         error_if_nonfinite: bool = False,
-        foreach: Optional[bool] = None,
+        foreach: bool | None = None,
     ) -> torch.Tensor:
         return clip_grad_norm_(
             self.net.parameters(),

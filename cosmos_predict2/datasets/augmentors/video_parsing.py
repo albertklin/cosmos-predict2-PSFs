@@ -15,7 +15,6 @@
 
 import io
 import random
-from typing import Optional
 
 import decord
 import numpy as np
@@ -33,7 +32,7 @@ class VideoParsing(Augmentor):
     the return dict is back-compatible with old datasets, which video decoding happens in the decoder stage.
     """
 
-    def __init__(self, input_keys: list, output_keys: Optional[list] = None, args: Optional[dict] = None) -> None:
+    def __init__(self, input_keys: list, output_keys: list | None = None, args: dict | None = None) -> None:
         super().__init__(input_keys, output_keys, args)
         assert len(input_keys) == 2, "VideoParsing augmentor only supports two input keys"
         self.meta_key = input_keys[0]
@@ -87,7 +86,7 @@ class VideoParsing(Augmentor):
         # shuffle options
         random.shuffle(options)
         video_frames = None
-        for chunk_index, option in options:
+        for chunk_index, option in options:  # noqa: B007
             start_frame = option["start_frame"]
             end_frame = option["end_frame"]
             if (end_frame - start_frame) < self.min_duration * video_info["fps"]:
@@ -100,9 +99,9 @@ class VideoParsing(Augmentor):
 
             # online hot-fix for alpamayo data. Skip the first 5 frames as there is chance that the first five frames contain black frames.
             if "alpamayo" in data_dict["__url__"].root:
-                assert (
-                    len(frame_indices) >= 5
-                ), "Getting less than 5 frames for alpamayo videos. There is no way to skip the first five frames."
+                assert len(frame_indices) >= 5, (
+                    "Getting less than 5 frames for alpamayo videos. There is no way to skip the first five frames."
+                )
                 frame_indices = frame_indices[5:]
                 start_frame += 5
             video_frames = video_reader.get_batch(frame_indices).asnumpy()

@@ -12,37 +12,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Any, List, Tuple, Union
 import math
 import os
+from typing import Any
 
 import numpy as np
 import torch
 import torchvision
 import torchvision.transforms.functional as F
-from einops import rearrange
 from megatron.core import parallel_state
 from tqdm import tqdm
 
-from imaginaire.utils import log, misc
-from imaginaire.lazy_config import LazyDict, instantiate
-from imaginaire.utils.easy_io import easy_io
-from imaginaire.utils.ema import FastEmaModelUpdater
-
-from cosmos_predict2.utils.context_parallel import cat_outputs_cp, split_inputs_cp
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
-from cosmos_predict2.auxiliary.text_encoder import CosmosT5TextEncoder
 from cosmos_predict2.conditioner import DataType
+from cosmos_predict2.configs.base.config_text2image import Text2ImagePipelineConfig
+from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
 from cosmos_predict2.datasets.utils import IMAGE_RES_SIZE_INFO, VIDEO_RES_SIZE_INFO
 from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
-from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
-from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
 from cosmos_predict2.pipelines.text2image import Text2ImagePipeline, get_sample_batch
-from cosmos_predict2.pipelines.video2world import Video2WorldPipeline, read_and_process_video, read_and_process_image
+from cosmos_predict2.pipelines.video2world import Video2WorldPipeline, read_and_process_image, read_and_process_video
+from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
+from cosmos_predict2.utils.context_parallel import cat_outputs_cp, split_inputs_cp
+from imaginaire.auxiliary.text_encoder import get_cosmos_text_encoder
+from imaginaire.lazy_config import LazyDict, instantiate
+from imaginaire.utils import log, misc
+from imaginaire.utils.easy_io import easy_io
+from imaginaire.utils.ema import FastEmaModelUpdater
 
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", "webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
+
 
 def process_video_first_frame(
     video_path: str,
@@ -72,11 +72,11 @@ def process_video_first_frame(
         video_frames, video_metadata = easy_io.load(video_path)  # Returns (T, H, W, C) numpy array
         log.info(f"Loaded video with shape {video_frames.shape}, metadata: {video_metadata}")
     except Exception as e:
-        raise ValueError(f"Failed to load video {video_path}: {e}")
+        raise ValueError(f"Failed to load video {video_path}: {e}")  # noqa: B904
 
     # Extract only the first frame
     first_frame = video_frames[0]  # (H, W, C)
-    
+
     # Convert numpy array to tensor and normalize to [0, 1] range
     frame_tensor = torch.from_numpy(first_frame).float() / 255.0  # (H, W, C)
     frame_tensor = frame_tensor.permute(2, 0, 1)  # (C, H, W)
@@ -88,22 +88,23 @@ def process_video_first_frame(
 
         # Calculate scaling based on aspect ratio
         scaling_ratio = max((target_w / W), (target_h / H))
-        resizing_shape = (int(math.ceil(scaling_ratio * H)), int(math.ceil(scaling_ratio * W)))
+        resizing_shape = (int(math.ceil(scaling_ratio * H)), int(math.ceil(scaling_ratio * W)))  # noqa: RUF046
 
         # Add batch dimension for resize operation
         frame_tensor = frame_tensor.unsqueeze(0)  # (1, C, H, W)
-        
+
         # Resize and crop the frame
         frame_tensor = F.resize(frame_tensor, resizing_shape)
         frame_tensor = F.center_crop(frame_tensor, resolution)
-        
+
         # Remove batch dimension
         frame_tensor = frame_tensor.squeeze(0)  # (C, H, W)
 
     # Add batch and time dimensions: (C, H, W) -> (1, C, 1, H, W)
     frame_tensor = frame_tensor.unsqueeze(0).unsqueeze(2)  # (1, C, 1, H, W)
-    
+
     return frame_tensor
+
 
 def read_and_process_video_first_frames(
     video_path: str,
@@ -141,7 +142,7 @@ def read_and_process_video_first_frames(
         video_frames, video_metadata = easy_io.load(video_path)  # Returns (T, H, W, C) numpy array
         log.info(f"Loaded video with shape {video_frames.shape}, metadata: {video_metadata}")
     except Exception as e:
-        raise ValueError(f"Failed to load video {video_path}: {e}")
+        raise ValueError(f"Failed to load video {video_path}: {e}")  # noqa: B904
 
     # Convert numpy array to tensor and rearrange dimensions
     video_tensor = torch.from_numpy(video_frames).float() / 255.0  # Convert to [0, 1] range
@@ -172,7 +173,7 @@ def read_and_process_video_first_frames(
 
         # Calculate scaling based on aspect ratio
         scaling_ratio = max((target_w / W), (target_h / H))
-        resizing_shape = (int(math.ceil(scaling_ratio * H)), int(math.ceil(scaling_ratio * W)))
+        resizing_shape = (int(math.ceil(scaling_ratio * H)), int(math.ceil(scaling_ratio * W)))  # noqa: RUF046
 
         # Resize and crop the extracted frames
         extracted_frames = torchvision.transforms.functional.resize(extracted_frames, resizing_shape)
@@ -205,12 +206,13 @@ def read_and_process_video_first_frames(
     full_video = full_video.unsqueeze(0).permute(0, 2, 1, 3, 4)
     return full_video
 
+
 class Text2ImageSDEditPipeline(Text2ImagePipeline):
     @staticmethod
     def from_config(
-        config: LazyDict,
+        config: LazyDict[Text2ImagePipelineConfig],
         dit_path: str = "",
-        text_encoder_path: str = "",
+        use_text_encoder: bool = True,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
@@ -243,24 +245,21 @@ class Text2ImageSDEditPipeline(Text2ImagePipeline):
 
         # 3. Set up tokenizer
         pipe.tokenizer = instantiate(config.tokenizer)
-        assert (
-            pipe.tokenizer.latent_ch == pipe.config.state_ch
-        ), f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+            f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        )
 
         # 4. Load text encoder
-        if text_encoder_path:
-            # inference
-            pipe.text_encoder = CosmosT5TextEncoder(device=device, cache_dir=text_encoder_path)
-            pipe.text_encoder.to(device)
+        if use_text_encoder:
+            pipe.text_encoder = get_cosmos_text_encoder(config=config.text_encoder, device=device)
         else:
-            # training
             pipe.text_encoder = None
 
         # 5. Initialize conditioner
         pipe.conditioner = instantiate(config.conditioner)
-        assert (
-            sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0
-        ), "conditioner should not have learnable parameters"
+        assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+            "conditioner should not have learnable parameters"
+        )
 
         if config.guardrail_config.enabled:
             from cosmos_predict2.auxiliary.guardrail.common import presets as guardrail_presets
@@ -317,12 +316,12 @@ class Text2ImageSDEditPipeline(Text2ImagePipeline):
             pipe.data_parallel_size = 1
 
         return pipe
-    
+
     @torch.no_grad()
     def __call__(
         self,
         prompt: str,
-        input_video_path: str, 
+        input_video_path: str,
         edit_strength: float = 0.5,
         negative_prompt: str = "",
         aspect_ratio: str = "16:9",
@@ -362,9 +361,7 @@ class Text2ImageSDEditPipeline(Text2ImagePipeline):
             _W // self.tokenizer.spatial_compression_factor,
         ]
 
-        vid_first_frame = process_video_first_frame(
-                input_video_path, [height, width], resize=True
-            )
+        vid_first_frame = process_video_first_frame(input_video_path, [height, width], resize=True)
         data_batch["images"] = vid_first_frame.to(self.tensor_kwargs["device"], dtype=self.torch_dtype)
 
         # Obtains the latent state and condition.
@@ -387,12 +384,12 @@ class Text2ImageSDEditPipeline(Text2ImagePipeline):
 
         x_sigma_max = (
             misc.arch_invariant_rand(
-                (n_sample,) + tuple(state_shape),
+                (n_sample,) + tuple(state_shape),  # noqa: RUF005
                 torch.float32,
                 self.tensor_kwargs["device"],
                 seed,
             )
-            #* self.scheduler.config.sigma_max
+            # * self.scheduler.config.sigma_max
         )
 
         # ------------------------------------------------------------------ #
@@ -405,13 +402,15 @@ class Text2ImageSDEditPipeline(Text2ImagePipeline):
 
         # Bring the initial latent into the precision expected by the scheduler
         edit_step = int(num_sampling_step * (1 - edit_strength))
-        sample = self.scheduler.add_noise(latent_state, x_sigma_max, self.scheduler.timesteps[edit_step:edit_step+1])
+        sample = self.scheduler.add_noise(
+            latent_state, x_sigma_max, self.scheduler.timesteps[edit_step : edit_step + 1]
+        )
         sample = sample.to(dtype=torch.float32)
         timesteps = self.scheduler.timesteps[edit_step:]
 
         x0_prev: torch.Tensor | None = None
 
-        for i, timestep in enumerate(tqdm(timesteps, desc="Generating image")):
+        for i, timestep in enumerate(tqdm(timesteps, desc="Generating image")):  # noqa: B007
             step = int(timestep)
             # Current noise level (sigma_t).
             sigma_t = scheduler.sigmas[step].to(sample.device, dtype=torch.float32)
@@ -447,12 +446,13 @@ class Text2ImageSDEditPipeline(Text2ImagePipeline):
         log.success("Image generation completed successfully")
         return image
 
+
 class Video2WorldSDEditPipeline(Video2WorldPipeline):
     @staticmethod
     def from_config(
         config: Video2WorldPipelineConfig,
         dit_path: str = "",
-        text_encoder_path: str = "",
+        use_text_encoder: bool = True,
         device: str = "cuda",
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
@@ -487,24 +487,21 @@ class Video2WorldSDEditPipeline(Video2WorldPipeline):
 
         # 3. Set up tokenizer
         pipe.tokenizer = instantiate(config.tokenizer)
-        assert (
-            pipe.tokenizer.latent_ch == pipe.config.state_ch
-        ), f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+            f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+        )
 
         # 4. Load text encoder
-        if text_encoder_path:
-            # inference
-            pipe.text_encoder = CosmosT5TextEncoder(device=device, cache_dir=text_encoder_path)
-            pipe.text_encoder.to(device)
+        if use_text_encoder:
+            pipe.text_encoder = get_cosmos_text_encoder(config=config.text_encoder, device=device)
         else:
-            # training
             pipe.text_encoder = None
 
         # 5. Initialize conditioner
         pipe.conditioner = instantiate(config.conditioner)
-        assert (
-            sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0
-        ), "conditioner should not have learnable parameters"
+        assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+            "conditioner should not have learnable parameters"
+        )
 
         if load_prompt_refiner:
             pipe.prompt_refiner = CosmosReason1(
@@ -578,7 +575,7 @@ class Video2WorldSDEditPipeline(Video2WorldPipeline):
         self,
         input_path: str,
         prompt: str,
-        input_video_path: str, 
+        input_video_path: str,
         edit_strength: float = 0.5,
         negative_prompt: str = "",
         aspect_ratio: str = "16:9",
@@ -663,8 +660,10 @@ class Video2WorldSDEditPipeline(Video2WorldPipeline):
             )
 
         # read input video
-        input_video = read_and_process_video_first_frames(input_video_path, [height, width], num_video_frames, resize=True)
-        
+        input_video = read_and_process_video_first_frames(
+            input_video_path, [height, width], num_video_frames, resize=True
+        )
+
         # Prepare the data batch with text embeddings
         data_batch = self._get_data_batch_input(
             vid_input, prompt, negative_prompt, num_latent_conditional_frames=num_latent_conditional_frames
@@ -687,7 +686,7 @@ class Video2WorldSDEditPipeline(Video2WorldPipeline):
         x0_fn = self.get_x0_fn_from_batch(
             data_batch, guidance, is_negative_prompt=True, use_cuda_graphs=use_cuda_graphs
         )
-        
+
         log.info("Encoding input video...")
         input_video = input_video.cuda().to(dtype=torch.bfloat16)
         input_video = input_video.to(**self.tensor_kwargs) / 127.5 - 1.0
@@ -697,7 +696,7 @@ class Video2WorldSDEditPipeline(Video2WorldPipeline):
 
         x_sigma_max = (
             misc.arch_invariant_rand(
-                (n_sample,) + tuple(state_shape),
+                (n_sample,) + tuple(state_shape),  # noqa: RUF005
                 torch.float32,
                 self.tensor_kwargs["device"],
                 seed,
@@ -719,13 +718,15 @@ class Video2WorldSDEditPipeline(Video2WorldPipeline):
 
         # Bring the initial latent into the precision expected by the scheduler
         edit_step = int(num_sampling_step * (1 - edit_strength))
-        sample = self.scheduler.add_noise(input_video_latent, x_sigma_max, self.scheduler.timesteps[edit_step:edit_step+1])
+        sample = self.scheduler.add_noise(
+            input_video_latent, x_sigma_max, self.scheduler.timesteps[edit_step : edit_step + 1]
+        )
         sample = sample.to(dtype=torch.float32)
         timesteps = self.scheduler.timesteps[edit_step:]
 
         x0_prev: torch.Tensor | None = None
 
-        for i, timestep in enumerate(tqdm(timesteps, desc="Generating video")):
+        for i, timestep in enumerate(tqdm(timesteps, desc="Generating video")):  # noqa: B007
             step = int(timestep)
             # Current noise level (sigma_t).
             sigma_t = scheduler.sigmas[step].to(sample.device, dtype=torch.float32)

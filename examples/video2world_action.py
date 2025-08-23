@@ -26,8 +26,12 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import torch
 from megatron.core import parallel_state
 
-from cosmos_predict2.configs.action_conditioned.config import PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
+from cosmos_predict2.configs.action_conditioned.config import get_cosmos_predict2_action_conditioned_pipeline
 from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
+from imaginaire.constants import (
+    CosmosPredict2ActionConditionedModelSize,
+    get_cosmos_predict2_action_conditioned_checkpoint,
+)
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video
 
@@ -35,7 +39,7 @@ import time
 
 
 def get_action_sequence(annotation_path):
-    with open(annotation_path, "r") as file:
+    with open(annotation_path) as file:
         data = json.load(file)
 
     # rescale the action to the original scale
@@ -51,7 +55,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Video-to-World Generation with Cosmos Predict2")
     parser.add_argument(
         "--model_size",
-        choices=["2B"],
+        choices=CosmosPredict2ActionConditionedModelSize.__args__,
         default="2B",
         help="Size of the model to use for video-to-world generation",
     )
@@ -126,18 +130,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def setup_pipeline(args: argparse.Namespace):
-    log.info(f"Using model size: {args.model_size}")
-    if args.model_size == "2B":
-        config = PREDICT2_VIDEO2WORLD_PIPELINE_2B_ACTION_CONDITIONED
-        # dit_path = "checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pth"
-        dit_path = "checkpoints/nvidia/Cosmos-Predict2-2B-Sample-Action-Conditioned/model-480p-4fps.pt"
-    else:
-        raise ValueError("Invalid model size. Choose either '2B' or '14B'.")
+    resolution = "480"
+    fps = 4
+    config = get_cosmos_predict2_action_conditioned_pipeline(model_size=args.model_size, resolution=resolution, fps=fps)
     if hasattr(args, "dit_path") and args.dit_path:
         dit_path = args.dit_path
-
-    # text_encoder_path = "checkpoints/google-t5/t5-11b"
-    text_encoder_path = ""
+    else:
+        dit_path = get_cosmos_predict2_action_conditioned_checkpoint(
+            model_size=args.model_size, resolution=resolution, fps=fps
+        )
 
     misc.set_random_seed(seed=args.seed, by_rank=True)
     # Initialize cuDNN.
@@ -169,7 +170,7 @@ def setup_pipeline(args: argparse.Namespace):
     pipe = Video2WorldActionConditionedPipeline.from_config(
         config=config,
         dit_path=dit_path,
-        text_encoder_path=text_encoder_path,
+        use_text_encoder=False,
         device="cuda",
         torch_dtype=torch.bfloat16,
         # load_ema_to_reg=args.load_ema,

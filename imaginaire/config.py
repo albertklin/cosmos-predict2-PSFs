@@ -18,12 +18,13 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional, Type, TypeVar, Union
+from typing import Any, TypeVar
 
 import attrs
 import torch
 import torch.utils.data
-import torch.utils.data.distributed
+
+from imaginaire.model import ImaginaireModel
 
 try:
     from megatron.core import ModelParallelConfig
@@ -32,6 +33,8 @@ try:
 except ImportError:
     USE_MEGATRON = False
     print("Megatron-core is not installed.")
+
+import builtins
 
 from imaginaire.lazy_config import LazyCall as L
 from imaginaire.lazy_config import LazyDict
@@ -91,7 +94,7 @@ def make_freezable(cls: T) -> T:
 
     original_setattr = cls.__setattr__
 
-    def setattr_override(self, key, value) -> None:  # noqa: ANN001
+    def setattr_override(self, key, value) -> None:
         """
         Override __setattr__ to allow modifications during initialization
         and prevent modifications once the instance is frozen.
@@ -142,7 +145,7 @@ def _pretty_print_attrs_instance(obj: object, indent: int = 0, use_color: bool =
     return "\n".join(lines)
 
 
-def pretty_print_overrides(overrides: Optional[list[str]] = None, use_color: bool = False) -> str:
+def pretty_print_overrides(overrides: list[str] | None = None, use_color: bool = False) -> str:
     """
     Pretty prints overrides.
     """
@@ -244,7 +247,7 @@ class JITConfig:
     # Enable exporting a JIT compiled model.
     enabled: bool = False
     # Input tensor shape, for example input.
-    input_shape: Union[list[int], None] = None
+    input_shape: list[int] | None = None
     # Device to compile onto.
     device: str = "cuda"
     # # Data type to compile onto.
@@ -257,7 +260,7 @@ class JITConfig:
 @attrs.define(slots=False)
 class CheckpointConfig:
     # possible checkpoint class
-    type: Optional[Dict] = None
+    type: dict | None = None
     # for dcp, whether to use async mode
     dcp_async_mode_enabled: bool = False
     # Save the checkpoint every N iterations.
@@ -275,7 +278,7 @@ class CheckpointConfig:
     # Print detailed information during checkpoint saving/loading.
     verbose: bool = True
     # keys not to resume from the checkpoint, choices: ["model", "optim", "scheduler", "trainer"]
-    keys_not_to_resume: list[str] = []
+    keys_not_to_resume: list[str] = []  # noqa: RUF008
     # Whether to use the local filesystem for broadcasting checkpoint data (used for Tensor Parallel Checkpointer).
     broadcast_via_filesystem: bool = False
     load_ema_to_reg: bool = False
@@ -314,10 +317,10 @@ class Profiling:
 class TrainerConfig:
     from imaginaire.trainer import ImaginaireTrainer
 
-    type: Type[ImaginaireTrainer] = ImaginaireTrainer
+    type: builtins.type[ImaginaireTrainer] = ImaginaireTrainer
     # Set the callback class.
     # Defaults to the callbacks below.
-    callbacks: LazyDict = LazyDict(
+    callbacks: LazyDict[dict[str, callback.Callback]] = LazyDict(  # noqa: RUF009
         dict(
             ema=L(callback.EMAModelCallback)(),
             progress_bar=L(callback.ProgressBarCallback)(),
@@ -362,15 +365,15 @@ class Config:
     """
 
     # Model configs.
-    model: LazyDict
+    model: LazyDict[ImaginaireModel]
     # Optimizer configs.
-    optimizer: LazyDict
+    optimizer: LazyDict[torch.optim.Optimizer]
     # Scheduler configs.
-    scheduler: LazyDict
+    scheduler: LazyDict[torch.optim.lr_scheduler.LRScheduler]
     # Training data configs.
-    dataloader_train: LazyDict
+    dataloader_train: LazyDict[torch.utils.data.DataLoader]
     # Validation data configs.
-    dataloader_val: LazyDict
+    dataloader_val: LazyDict[torch.utils.data.DataLoader]
 
     # Training job configs.
     job: JobConfig = attrs.field(factory=JobConfig)

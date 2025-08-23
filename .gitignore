@@ -200,3 +200,5 @@ cython_debug/
 /examples/**/checkpoints
 /examples/**/output
 /examples/**/datasets
+
+cosmos-predict2.sif

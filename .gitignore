@@ -202,3 +202,4 @@ cython_debug/
 /examples/**/datasets
 
 cosmos-predict2.sif
+wandb

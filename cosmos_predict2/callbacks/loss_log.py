@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+import wandb
 
 from imaginaire.model import ImaginaireModel
 from imaginaire.utils import distributed, log
@@ -65,6 +66,8 @@ class LossLog(Callback):
             info = {
                 "train_loss_step": loss.detach().item(),
             }
+            if wandb.run:
+                wandb.log(info, step=iteration)
 
     def on_training_step_end(
         self,
@@ -97,3 +100,5 @@ class LossLog(Callback):
                 info = {}
                 if iter_count > 0:
                     info[f"train@{self.logging_iter_multipler}/loss"] = loss
+                    if wandb.run:
+                        wandb.log(info, step=iteration)

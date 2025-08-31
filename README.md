@@ -1,3 +1,6 @@
+This repository is a fork of [cosmos-predict2](https://github.com/nvidia-cosmos/cosmos-predict2), modified for use in [predictive_safety_filters](https://github.com/albertklin/predictive_safety_filters).\
+Refer to [predictive_safety_filters/README.md](https://github.com/albertklin/predictive_safety_filters/blob/main/README.md).
+
 <p align="center">
     <img src="assets/nvidia-cosmos-header.png" alt="NVIDIA Cosmos Header">
 </p>

@@ -177,13 +177,32 @@ class Dataset(Dataset):
 
 
 if __name__ == "__main__":
+
     dataset = Dataset(
         dataset_dir="datasets/benchmark_train/gr1",
         num_frames=93,
         video_size=[480, 832],
     )
 
-    indices = [0, 13, -1]
+    indices = [0, len(dataset)//2, -1]
+    for idx in indices:
+        data = dataset[idx]
+        log.info(
+            f"{idx=} "
+            f"{data['video'].sum()=}\n"
+            f"{data['video'].shape=}\n"
+            f"{data['video_name']=}\n"
+            f"{data['t5_text_embeddings'].shape=}\n"
+            "---"
+        )
+
+    dataset = Dataset(
+        dataset_dir="datasets/coffee_table_10fps",
+        num_frames=50,
+        video_size=[480, 640],
+    )
+
+    indices = [0, len(dataset)//2, -1]
     for idx in indices:
         data = dataset[idx]
         log.info(

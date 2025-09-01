@@ -518,23 +518,33 @@ class Video2WorldPipeline(BasePipeline):
 
             if self.config.resize_online:
 
-                def temporal_sample(video: torch.Tensor, expected_length: int) -> torch.Tensor:
-                    # sample consecutive video frames to match expected_length
-                    original_length = video.shape[2]
-                    if original_length == 1:
-                        log.info("Video is length 1. Returning an expanded view...")
-                        return video.expand(-1, -1, expected_length, -1, -1)
-                    if original_length != expected_length:
-                        # video in [B C T H W] format
-                        start_frame = np.random.randint(0, original_length - expected_length)
-                        end_frame = start_frame + expected_length
-                        video = video[:, :, start_frame:end_frame, :, :]
-                    return video
+                # def temporal_sample(video: torch.Tensor, expected_length: int) -> torch.Tensor:
+                #     # sample consecutive video frames to match expected_length
+                #     original_length = video.shape[2]
+                #     if original_length == 1:
+                #         log.info("Video is length 1. Returning an expanded view...")
+                #         return video.expand(-1, -1, expected_length, -1, -1)
+                #     if original_length != expected_length:
+                #         # video in [B C T H W] format
+                #         start_frame = np.random.randint(0, original_length - expected_length)
+                #         end_frame = start_frame + expected_length
+                #         video = video[:, :, start_frame:end_frame, :, :]
+                #     return video
 
+                # expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
+                # original_length = data_batch[input_key].shape[2]
+                # if original_length != expected_length:
+                #     data_batch[input_key] = temporal_sample(data_batch[input_key], expected_length)
+
+                # fix from GitHub: https://github.com/nvidia-cosmos/cosmos-predict2/issues/105
+                from torchvision.transforms.v2 import UniformTemporalSubsample
                 expected_length = self.tokenizer.get_pixel_num_frames(self.config.state_t)
                 original_length = data_batch[input_key].shape[2]
                 if original_length != expected_length:
-                    data_batch[input_key] = temporal_sample(data_batch[input_key], expected_length)
+                    video = rearrange(data_batch[input_key], "b c t h w -> b t c h w")
+                    video = UniformTemporalSubsample(expected_length)(video)
+                    data_batch[input_key] = rearrange(video, "b t c h w -> b c t h w")
+                ##############################################################################
 
     def _augment_image_dim_inplace(self, data_batch: dict[str, torch.Tensor], input_key: str = None) -> None:  # noqa: RUF013
         input_key = self.input_image_key if input_key is None else input_key

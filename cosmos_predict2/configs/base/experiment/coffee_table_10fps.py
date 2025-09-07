@@ -91,7 +91,7 @@ finetune_cosmos_v2w_2b_coffee_table_10fps = dict(
     ),
     scheduler=dict(
         warm_up_steps=[0],
-        cycle_lengths=[1_000],
+        cycle_lengths=[100_000],
         f_max=[0.6],
         f_min=[0.0],
     ),
@@ -140,7 +140,7 @@ finetune_cosmos_v2w_14b_coffee_table_10fps = dict(
     ),
     scheduler=dict(
         warm_up_steps=[0],
-        cycle_lengths=[1_000],
+        cycle_lengths=[100_000],
         f_max=[0.25],
         f_min=[0.0],
     ),

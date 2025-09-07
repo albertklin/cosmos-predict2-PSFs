@@ -94,3 +94,27 @@ python examples/video2world_action.py \
   --disable_guardrail \
   --disable_prompt_refiner
 ```
+
+## 4. LoRA Inference
+
+To run inference with a LoRA-adapted action-conditioned model, use the dedicated script:
+
+```bash
+export NUM_GPUS=8
+
+torchrun --nproc_per_node=${NUM_GPUS} examples/video2world_action_lora.py \
+  --model_size 2B \
+  --dit_path "checkpoints/posttraining/video2world_lora/2b_action_conditioned/checkpoints/model/iter_000001000.pt" \
+  --input_video datasets/bridge/videos/test/13/rgb.mp4 \
+  --input_annotation datasets/bridge/annotation/test/13.json \
+  --num_conditional_frames 1 \
+  --save_dir output/generated_video_lora \
+  --guidance 0 \
+  --seed 0 \
+  --use_lora \
+  --lora_rank 16 \
+  --lora_alpha 16 \
+  --lora_target_modules "q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2" \
+  --disable_guardrail \
+  --disable_prompt_refiner
+```

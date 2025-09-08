@@ -988,7 +988,26 @@ class MultiViewCondition(VideoCondition):
         return type(self)(**kwargs)
 
 
+@dataclass(frozen=True)
+class MultiViewActionCondition(MultiViewCondition):
+    """Extension of :class:`MultiViewCondition` with action tensor."""
+
+    action: torch.Tensor | None = None
+
+
 class MultiViewConditioner(GeneralConditioner):
     def forward(self, batch: dict, override_dropout_rate: dict[str, float] | None = None) -> MultiViewCondition:
         output = super()._forward(batch, override_dropout_rate)
         return MultiViewCondition(**output)
+
+
+class MultiViewActionConditioner(MultiViewConditioner):
+    """Conditioner that also forwards per-step actions."""
+
+    def forward(
+        self, batch: dict, override_dropout_rate: dict[str, float] | None = None
+    ) -> MultiViewActionCondition:
+        output = super()._forward(batch, override_dropout_rate)
+        assert "action" in batch, "MultiViewActionConditioner requires 'action' in batch"
+        output["action"] = batch["action"]
+        return MultiViewActionCondition(**output)

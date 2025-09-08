@@ -19,6 +19,7 @@ import os
 
 import mediapy as mp
 import numpy as np
+from pathlib import Path
 
 # Set TOKENIZERS_PARALLELISM environment variable to avoid deadlocks with multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -32,8 +33,9 @@ from imaginaire.constants import (
     CosmosPredict2ActionConditionedModelSize,
     get_cosmos_predict2_action_conditioned_checkpoint,
 )
+from imaginaire.lazy_config.lazy import LazyConfig
 from imaginaire.utils import distributed, log, misc
-from imaginaire.utils.io import save_image_or_video
+from imaginaire.utils.io import save_image_or_video, save_text_prompts
 
 import time
 
@@ -71,16 +73,18 @@ def parse_args() -> argparse.Namespace:
         help="Use EMA weights for generation.",
     )
     parser.add_argument(
-        "--input_video",
+        "--input_videos",
+        nargs="+",
         type=str,
-        default="assets/video2world/input0.jpg",
-        help="Path to input image or video for conditioning (include file extension)",
+        required=True,
+        help="List of input videos for conditioning",
     )
     parser.add_argument(
-        "--input_annotation",
+        "--input_annotations",
+        nargs="+",
         type=str,
-        default="assets/video2world/input0.jpg",
-        help="Path to input image or video for conditioning (include file extension)",
+        required=True,
+        help="List of annotation files corresponding to input_videos",
     )
     parser.add_argument(
         "--num_conditional_frames",
@@ -97,12 +101,31 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--autoregressive", action="store_true", help="Use autoregressive mode")
     parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument(
-        "--save_dir",
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="List of random seeds for reproducibility",
+    )
+    parser.add_argument(
+        "--num_generations",
+        type=int,
+        default=1,
+        help="Number of generations for the input",
+    )
+    parser.add_argument(
+        "--pipeline_seed",
+        type=int,
+        default=0,
+        help="Seed used for pipeline initialization",
+    )
+    parser.add_argument(
+        "--save_paths",
+        nargs="+",
         type=str,
-        default="output/generated_videos",
-        help="Directory to save the generated videos",
+        required=True,
+        help="List of paths to save the generated videos",
     )
     parser.add_argument(
         "--num_gpus",
@@ -115,16 +138,10 @@ def parse_args() -> argparse.Namespace:
         "--disable_prompt_refiner", action="store_true", help="Disable prompt refiner that enhances short prompts"
     )
     parser.add_argument(
-        "--prompt", default=""
-    )
-    parser.add_argument(
         "--negative_prompt", default=""
     )
     parser.add_argument(
         "--batch_size", type=int, default=1
-    )
-    parser.add_argument(
-        "--num_generations", type=int, default=1, help="Number of generations to run"
     )
     return parser.parse_args()
 
@@ -140,7 +157,7 @@ def setup_pipeline(args: argparse.Namespace):
             model_size=args.model_size, resolution=resolution, fps=fps
         )
 
-    misc.set_random_seed(seed=args.seed, by_rank=True)
+    misc.set_random_seed(seed=args.pipeline_seed, by_rank=True)
     # Initialize cuDNN.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
@@ -186,7 +203,15 @@ def read_first_frame(video_path):
 
 
 def process_single_generation(
-    pipe, input_path, input_annotation, output_dir, guidance, seed, chunk_size, autoregressive
+    pipe,
+    input_path,
+    input_annotation,
+    output_path,
+    negative_prompt,
+    guidance,
+    seed,
+    chunk_size,
+    autoregressive,
 ):
     actions = get_action_sequence(input_annotation)
     first_frame = read_first_frame(input_path)
@@ -210,8 +235,8 @@ def process_single_generation(
                 num_conditional_frames=1,
                 guidance=guidance,
                 seed=seed+i,
-                prompt=args.prompt,
-                negative_prompt=args.negative_prompt,
+                prompt="",
+                negative_prompt=negative_prompt,
             )
             print(f"Inference time: {time.time() - start_time:.2f} s")
             first_frame = ((video[:, :, -1].permute(0, 2, 3, 1).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
@@ -225,31 +250,50 @@ def process_single_generation(
             num_conditional_frames=1,
             guidance=guidance,
             seed=seed,
-            prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
+            prompt="",
+            negative_prompt=negative_prompt,
         )
         print(f"Inference time: {time.time() - start_time:.2f} s")
 
     if video is not None:
-        # save the generated videos
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        log.info(f"Saving generated videos to: {output_dir}")
-        for i, v in enumerate(video):
-            save_image_or_video(v, os.path.join(output_dir, f"{i}.mp4"), fps=4)
-        log.success(f"Successfully saved videos to: {output_dir}")
+        out_dir = os.path.dirname(output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        log.info(f"Saving generated videos to: {output_path}")
+        if len(video) == 1:
+            save_image_or_video(video[0], output_path, fps=4)
+        else:
+            base = Path(output_path).with_suffix("")
+            for i, v in enumerate(video):
+                save_image_or_video(v, f"{base}_{i}.mp4", fps=4)
+        log.success(f"Successfully saved videos to: {output_path}")
+        output_prompt_path = os.path.splitext(output_path)[0] + ".txt"
+        prompts_to_save = {"negative_prompt": negative_prompt}
+        save_text_prompts(prompts_to_save, output_prompt_path)
+        log.success(f"Successfully saved prompt file to: {output_prompt_path}")
+        config_path = os.path.splitext(output_path)[0] + ".yaml"
+        LazyConfig.save_yaml(pipe.config, config_path)
+        log.success(f"Successfully saved config file to: {config_path}")
         return True
     return False
 
 
-def generate_video(args: argparse.Namespace, pipe: Video2WorldActionConditionedPipeline) -> None:
+def generate_video(
+    args: argparse.Namespace,
+    pipe: Video2WorldActionConditionedPipeline,
+    input_video: str,
+    input_annotation: str,
+    save_path: str,
+    seed: int = 0,
+) -> None:
     process_single_generation(
         pipe=pipe,
-        input_path=args.input_video,
-        input_annotation=args.input_annotation,
-        output_dir=args.save_dir,
+        input_path=input_video,
+        input_annotation=input_annotation,
+        output_path=save_path,
+        negative_prompt=args.negative_prompt,
         guidance=args.guidance,
-        seed=args.seed,
+        seed=seed,
         chunk_size=args.chunk_size,
         autoregressive=args.autoregressive,
     )
@@ -268,12 +312,29 @@ if __name__ == "__main__":
     args = parse_args()
     try:
         pipe = setup_pipeline(args)
-        seed = args.seed
-        save_dir = args.save_dir
-        for i in range(args.num_generations):
-            args.seed = seed + i
-            args.save_dir = os.path.join(save_dir, f"generation_{i}")
-            generate_video(args, pipe)
+        input_videos = args.input_videos
+        input_annotations = args.input_annotations
+        save_paths = args.save_paths
+        if not (
+            len(input_videos) == len(save_paths) == len(input_annotations)
+        ):
+            raise ValueError(
+                "input_videos, input_annotations, and save_paths must have the same length"
+            )
+        seeds = args.seeds if args.seeds else list(range(args.num_generations))
+        for seed in seeds:
+            for j in range(len(input_videos)):
+                output_path = (
+                    f"{Path(save_paths[j]).with_suffix('')}_pipeline_{args.pipeline_seed}_seed_{seed}.mp4"
+                )
+                generate_video(
+                    args,
+                    pipe,
+                    input_video=input_videos[j],
+                    input_annotation=input_annotations[j],
+                    save_path=output_path,
+                    seed=seed,
+                )
     finally:
         # Make sure to clean up the distributed environment
         cleanup_distributed()

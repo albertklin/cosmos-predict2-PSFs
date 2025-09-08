@@ -37,8 +37,10 @@ from imaginaire.constants import (
     CosmosPredict2Video2WorldResolution,
     get_cosmos_predict2_video2world_checkpoint,
 )
+from imaginaire.lazy_config.lazy import LazyConfig
 from imaginaire.utils import distributed, log, misc
-from imaginaire.utils.io import save_image_or_video
+from imaginaire.utils.io import save_image_or_video, save_text_prompts
+from pathlib import Path
 
 _DEFAULT_NEGATIVE_PROMPT = "The video captures a series of frames showing ugly scenes, static with no motion, motion blur, over-saturation, shaky footage, low resolution, grainy texture, pixelated images, poorly lit areas, underexposed and overexposed scenes, poor color balance, washed out colors, choppy sequences, jerky movements, low frame rate, artifacting, color banding, unnatural transitions, outdated special effects, fake elements, unconvincing visuals, poorly edited content, jump cuts, visual noise, and flickering. Overall, the video is of poor quality."
 
@@ -320,16 +322,11 @@ def parse_args() -> argparse.Namespace:
         help="Whether to initialize LoRA weights",
     )
     parser.add_argument(
-        "--prompt",
+        "--prompts",
+        nargs="+",
         type=str,
-        default="",
-        help="Text prompt for video generation",
-    )
-    parser.add_argument(
-        "--input_path",
-        type=str,
-        default="assets/video2world/input0.jpg",
-        help="Path to input image or video for conditioning (include file extension)",
+        default=[""],
+        help="List of text prompts for each input path",
     )
     parser.add_argument(
         "--negative_prompt",
@@ -350,14 +347,40 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Path to JSON file containing batch inputs. Each entry should have 'input_video', 'prompt', and 'output_video' fields.",
     )
-    parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument(
-        "--save_path",
+        "--input_paths",
+        nargs="+",
         type=str,
-        default="output/generated_video.mp4",
-        help="Path to save the generated video (include file extension)",
+        default=["assets/video2world/input0.jpg"],
+        help="List of input image or video paths for conditioning (include file extension)",
     )
+    parser.add_argument(
+        "--save_paths",
+        nargs="+",
+        type=str,
+        default=["output/generated_video.mp4"],
+        help="List of paths to save the generated videos (include file extension)",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="List of random seeds for reproducibility",
+    )
+    parser.add_argument(
+        "--num_generations",
+        type=int,
+        default=1,
+        help="Number of generations for the input",
+    )
+    parser.add_argument(
+        "--pipeline_seed",
+        type=int,
+        default=0,
+        help="Seed used for pipeline initialization",
+    )
+    parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
     parser.add_argument(
         "--num_gpus",
         type=int,
@@ -390,7 +413,7 @@ def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | N
         dit_path = get_cosmos_predict2_video2world_checkpoint(
             model_size=args.model_size, resolution=args.resolution, fps=args.fps
         )
-    misc.set_random_seed(seed=args.seed, by_rank=True)
+    misc.set_random_seed(seed=args.pipeline_seed, by_rank=True)
     # Initialize cuDNN.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
@@ -460,13 +483,14 @@ def process_single_generation(
         if benchmark and i > 0:
             torch.cuda.synchronize()
             start_time = time.time()
-        video = pipe(
+        video, prompt_used = pipe(
             prompt=prompt,
             negative_prompt=negative_prompt,
             input_path=input_path,
             num_conditional_frames=num_conditional_frames,
             guidance=guidance,
             seed=seed,
+            return_prompt=True,
         )
         if benchmark and i > 0:
             torch.cuda.synchronize()
@@ -485,6 +509,19 @@ def process_single_generation(
             fps = 16
         save_image_or_video(video, output_path, fps=fps)
         log.success(f"Successfully saved video to: {output_path}")
+        output_prompt_path = os.path.splitext(output_path)[0] + ".txt"
+        prompts_to_save = {"prompt": prompt, "negative_prompt": negative_prompt}
+        if (
+            pipe.prompt_refiner is not None
+            and getattr(pipe.config, "prompt_refiner_config", None) is not None
+            and getattr(pipe.config.prompt_refiner_config, "enabled", False)
+        ):
+            prompts_to_save["refined_prompt"] = prompt_used
+        save_text_prompts(prompts_to_save, output_prompt_path)
+        log.success(f"Successfully saved prompt file to: {output_prompt_path}")
+        config_path = os.path.splitext(output_path)[0] + ".yaml"
+        LazyConfig.save_yaml(pipe.config, config_path)
+        log.success(f"Successfully saved config file to: {config_path}")
         return True
     return False
 
@@ -500,6 +537,7 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
         log.info(f"Loading batch inputs from JSON file: {args.batch_input_json}")
         with open(args.batch_input_json) as f:
             batch_inputs = json.load(f)
+        seeds = args.seeds if args.seeds else list(range(args.num_generations))
         for idx, item in enumerate(tqdm(batch_inputs)):
             input_video = item.get("input_video", "")
             prompt = item.get("prompt", "")
@@ -507,29 +545,46 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
             if not input_video or not prompt:
                 log.warning(f"Skipping item {idx}: Missing input_video or prompt")
                 continue
-            process_single_generation(
-                pipe=pipe,
-                input_path=input_video,
-                prompt=prompt,
-                output_path=output_video,
-                negative_prompt=args.negative_prompt,
-                num_conditional_frames=args.num_conditional_frames,
-                guidance=args.guidance,
-                seed=args.seed,
-                benchmark=args.benchmark,
-            )
+            for seed in seeds:
+                output_path = (
+                    f"{Path(output_video).with_suffix('')}_pipeline_{args.pipeline_seed}_seed_{seed}.mp4"
+                )
+                process_single_generation(
+                    pipe=pipe,
+                    input_path=input_video,
+                    prompt=prompt,
+                    output_path=output_path,
+                    negative_prompt=args.negative_prompt,
+                    num_conditional_frames=args.num_conditional_frames,
+                    guidance=args.guidance,
+                    seed=seed,
+                    benchmark=args.benchmark,
+                )
     else:
-        process_single_generation(
-            pipe=pipe,
-            input_path=args.input_path,
-            prompt=args.prompt,
-            output_path=args.save_path,
-            negative_prompt=args.negative_prompt,
-            num_conditional_frames=args.num_conditional_frames,
-            guidance=args.guidance,
-            seed=args.seed,
-            benchmark=args.benchmark,
-        )
+        input_paths = args.input_paths
+        save_paths = args.save_paths
+        prompts = args.prompts
+        if not (len(input_paths) == len(save_paths) == len(prompts)):
+            raise ValueError(
+                "Number of input paths, save paths, and prompts must match"
+            )
+        seeds = args.seeds if args.seeds else list(range(args.num_generations))
+        for seed in seeds:
+            for input_path, prompt, save_path in zip(input_paths, prompts, save_paths):
+                output_path = (
+                    f"{Path(save_path).with_suffix('')}_pipeline_{args.pipeline_seed}_seed_{seed}.mp4"
+                )
+                process_single_generation(
+                    pipe=pipe,
+                    input_path=input_path,
+                    prompt=prompt,
+                    output_path=output_path,
+                    negative_prompt=args.negative_prompt,
+                    num_conditional_frames=args.num_conditional_frames,
+                    guidance=args.guidance,
+                    seed=seed,
+                    benchmark=args.benchmark,
+                )
     return
 
 

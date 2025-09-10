@@ -19,6 +19,8 @@ import attrs
 
 from cosmos_predict2.configs.action_conditioned.defaults.data import register_training_and_val_data_action_conditioned
 from cosmos_predict2.configs.action_conditioned.defaults.model import register_model_action_conditioned
+from cosmos_predict2.configs.multiview_action.defaults.data import register_training_and_val_data_multiview_action
+from cosmos_predict2.configs.multiview_action.defaults.model import register_model_multiview_action
 from cosmos_predict2.configs.base.defaults.callbacks import register_callbacks
 from cosmos_predict2.configs.base.defaults.checkpoint import register_checkpoint
 from cosmos_predict2.configs.base.defaults.data import register_training_and_val_data
@@ -89,9 +91,14 @@ def make_config() -> Config:
     register_training_and_val_data_action_conditioned()
     register_model_action_conditioned()
 
+    # multiview action-conditioned post-training config
+    register_training_and_val_data_multiview_action()
+    register_model_multiview_action()
+
     # experiment config are defined in the experiment folder
     # call import_all_modules_from_package to register them
     import_all_modules_from_package("cosmos_predict2.configs.base.experiment", reload=True)
     import_all_modules_from_package("cosmos_predict2.configs.base.experiment.multiview", reload=True)
     import_all_modules_from_package("cosmos_predict2.configs.action_conditioned.experiment", reload=True)
+    import_all_modules_from_package("cosmos_predict2.configs.multiview_action.experiment", reload=True)
     return c

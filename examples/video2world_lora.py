@@ -322,6 +322,11 @@ def parse_args() -> argparse.Namespace:
         help="Whether to initialize LoRA weights",
     )
     parser.add_argument(
+        "--load_ema",
+        action="store_true",
+        help="Use EMA weights for generation.",
+    )
+    parser.add_argument(
         "--prompts",
         nargs="+",
         type=str,
@@ -461,6 +466,7 @@ def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | N
             use_text_encoder=text_encoder is None,
             device="cuda",
             torch_dtype=torch.bfloat16,
+            load_ema_to_reg=args.load_ema,
             load_prompt_refiner=True,
         )
     # Set the provided text encoder if one was passed

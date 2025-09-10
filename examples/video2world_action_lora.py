@@ -392,7 +392,7 @@ def setup_pipeline(args: argparse.Namespace):
             use_text_encoder=False,
             device="cuda",
             torch_dtype=torch.bfloat16,
-            # load_ema_to_reg=args.load_ema,
+            load_ema_to_reg=args.load_ema,
             load_prompt_refiner=True,
         )
 
@@ -470,7 +470,7 @@ def process_single_generation(
                 save_image_or_video(v, f"{base}_{i}.mp4", fps=4)
         log.success(f"Successfully saved videos to: {output_path}")
         output_prompt_path = os.path.splitext(output_path)[0] + ".txt"
-        prompts_to_save = {"negative_prompt": negative_prompt}
+        prompts_to_save = {"negative_prompt": negative_prompt, "prompt": ""}
         save_text_prompts(prompts_to_save, output_prompt_path)
         log.success(f"Successfully saved prompt file to: {output_prompt_path}")
         config_path = os.path.splitext(output_path)[0] + ".yaml"

@@ -139,6 +139,7 @@ def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | N
         use_text_encoder=text_encoder is None,
         device="cuda",
         torch_dtype=torch.bfloat16,
+        load_ema_to_reg=args.load_ema,
         load_prompt_refiner=config.prompt_refiner_config.enabled,
     )
 
@@ -308,6 +309,11 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Custom path to the DiT model checkpoint for post-trained models.",
+    )
+    parser.add_argument(
+        "--load_ema",
+        action="store_true",
+        help="Use EMA weights for generation.",
     )
     parser.add_argument(
         "--prompt",

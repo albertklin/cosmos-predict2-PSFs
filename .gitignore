@@ -203,3 +203,4 @@ cython_debug/
 
 cosmos-predict2.sif
 wandb
+predictions

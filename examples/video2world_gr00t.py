@@ -39,10 +39,34 @@ from megatron.core import parallel_state
 from tqdm import tqdm
 
 from cosmos_predict2.configs.base.config_video2world import get_cosmos_predict2_video2world_pipeline
+from cosmos_predict2.models.utils import load_state_dict
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from examples.video2world import _DEFAULT_NEGATIVE_PROMPT, validate_input_file
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video, save_text_prompts
+
+
+def add_lora_to_model(
+    model,
+    lora_rank: int = 16,
+    lora_alpha: int = 16,
+    lora_target_modules: str = "q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
+    init_lora_weights: bool = True,
+):
+    """Add LoRA adapters to a model using the PEFT library."""
+    from peft import LoraConfig, inject_adapter_in_model
+
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        init_lora_weights=init_lora_weights,
+        target_modules=lora_target_modules.split(","),
+    )
+    model = inject_adapter_in_model(lora_config, model)
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.to(torch.float32)
+    return model
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +87,35 @@ def parse_args() -> argparse.Namespace:
         "--load_ema",
         action="store_true",
         help="Use EMA weights for generation.",
+    )
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Enable LoRA inference mode",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=16,
+        help="Rank of the LoRA adaptation",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="Alpha parameter for LoRA",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
+        help="Comma-separated list of target modules for LoRA",
+    )
+    parser.add_argument(
+        "--init_lora_weights",
+        action="store_true",
+        default=True,
+        help="Whether to initialize LoRA weights",
     )
     parser.add_argument(
         "--prompts",
@@ -191,14 +244,43 @@ def setup_pipeline(args: argparse.Namespace):
 
     # Load models
     log.info(f"Initializing Video2WorldPipeline with GR00T variant: {args.gr00t_variant}")
-    pipe = Video2WorldPipeline.from_config(
-        config=config,
-        dit_path=dit_path,
-        device="cuda",
-        torch_dtype=torch.bfloat16,
-        load_ema_to_reg=args.load_ema,
-        load_prompt_refiner=False,  # Disable prompt refiner for GR00T
-    )
+    if args.use_lora:
+        pipe = Video2WorldPipeline.from_config(
+            config=config,
+            dit_path="",
+            device="cuda",
+            torch_dtype=torch.bfloat16,
+            load_prompt_refiner=False,
+        )
+        pipe.dit = add_lora_to_model(
+            pipe.dit,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_target_modules,
+            init_lora_weights=args.init_lora_weights,
+        )
+        if dit_path:
+            log.info(f"Loading LoRA checkpoint from: {dit_path}")
+            state_dict = load_state_dict(dit_path)
+            state_dict_dit = {}
+            state_dict_ema = {}
+            for k, v in state_dict.items():
+                if k.startswith("net."):
+                    state_dict_dit[k[4:]] = v
+                elif k.startswith("net_ema."):
+                    state_dict_ema[k[8:]] = v
+            weights_to_load = state_dict_ema if args.load_ema and state_dict_ema else state_dict_dit
+            pipe.dit.load_state_dict(weights_to_load, strict=False, assign=True)
+            del state_dict, state_dict_dit, state_dict_ema
+    else:
+        pipe = Video2WorldPipeline.from_config(
+            config=config,
+            dit_path=dit_path,
+            device="cuda",
+            torch_dtype=torch.bfloat16,
+            load_ema_to_reg=args.load_ema,
+            load_prompt_refiner=False,  # Disable prompt refiner for GR00T
+        )
 
     return pipe
 

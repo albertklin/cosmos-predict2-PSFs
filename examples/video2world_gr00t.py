@@ -23,6 +23,7 @@ A variant of predict2_video2world.py for GR00T models that:
 import argparse
 import json
 import os
+from pathlib import Path
 
 from imaginaire.constants import (
     CosmosPredict2Gr00tModelSize,
@@ -38,10 +39,34 @@ from megatron.core import parallel_state
 from tqdm import tqdm
 
 from cosmos_predict2.configs.base.config_video2world import get_cosmos_predict2_video2world_pipeline
+from cosmos_predict2.models.utils import load_state_dict
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from examples.video2world import _DEFAULT_NEGATIVE_PROMPT, validate_input_file
 from imaginaire.utils import distributed, log, misc
 from imaginaire.utils.io import save_image_or_video, save_text_prompts
+
+
+def add_lora_to_model(
+    model,
+    lora_rank: int = 16,
+    lora_alpha: int = 16,
+    lora_target_modules: str = "q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
+    init_lora_weights: bool = True,
+):
+    """Add LoRA adapters to a model using the PEFT library."""
+    from peft import LoraConfig, inject_adapter_in_model
+
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        init_lora_weights=init_lora_weights,
+        target_modules=lora_target_modules.split(","),
+    )
+    model = inject_adapter_in_model(lora_config, model)
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.to(torch.float32)
+    return model
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,16 +89,47 @@ def parse_args() -> argparse.Namespace:
         help="Use EMA weights for generation.",
     )
     parser.add_argument(
-        "--prompt",
-        type=str,
-        default="",
-        help="Text prompt for video generation",
+        "--use_lora",
+        action="store_true",
+        help="Enable LoRA inference mode",
     )
     parser.add_argument(
-        "--input_path",
+        "--lora_rank",
+        type=int,
+        default=16,
+        help="Rank of the LoRA adaptation",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="Alpha parameter for LoRA",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
         type=str,
-        default="assets/video2world/input0.jpg",
-        help="Path to input image or video for conditioning (include file extension)",
+        default="q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
+        help="Comma-separated list of target modules for LoRA",
+    )
+    parser.add_argument(
+        "--init_lora_weights",
+        action="store_true",
+        default=True,
+        help="Whether to initialize LoRA weights",
+    )
+    parser.add_argument(
+        "--prompts",
+        nargs="+",
+        type=str,
+        default=[""],
+        help="List of text prompts for each input path",
+    )
+    parser.add_argument(
+        "--input_paths",
+        nargs="+",
+        type=str,
+        default=["assets/video2world/input0.jpg"],
+        help="List of input image or video paths for conditioning (include file extension)",
     )
     parser.add_argument(
         "--negative_prompt",
@@ -102,12 +158,31 @@ def parse_args() -> argparse.Namespace:
         help="Path to JSON file containing batch inputs. Each entry should have 'input_video', 'prompt', and 'output_video' fields.",
     )
     parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for reproducibility")
     parser.add_argument(
-        "--save_path",
+        "--save_paths",
+        nargs="+",
         type=str,
-        default="output/generated_video.mp4",
-        help="Path to save the generated video (include file extension)",
+        default=["output/generated_video.mp4"],
+        help="List of paths to save the generated videos (include file extension)",
+    )
+    parser.add_argument(
+        "--seeds",
+        nargs="+",
+        type=int,
+        default=None,
+        help="List of random seeds for reproducibility",
+    )
+    parser.add_argument(
+        "--num_generations",
+        type=int,
+        default=1,
+        help="Number of generations for each input",
+    )
+    parser.add_argument(
+        "--pipeline_seed",
+        type=int,
+        default=0,
+        help="Seed used for pipeline initialization",
     )
     parser.add_argument(
         "--num_gpus",
@@ -147,7 +222,7 @@ def setup_pipeline(args: argparse.Namespace):
         )
     log.info(f"Loading model from: {dit_path}")
 
-    misc.set_random_seed(seed=args.seed, by_rank=True)
+    misc.set_random_seed(seed=args.pipeline_seed, by_rank=True)
     # Initialize cuDNN.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
@@ -169,14 +244,43 @@ def setup_pipeline(args: argparse.Namespace):
 
     # Load models
     log.info(f"Initializing Video2WorldPipeline with GR00T variant: {args.gr00t_variant}")
-    pipe = Video2WorldPipeline.from_config(
-        config=config,
-        dit_path=dit_path,
-        device="cuda",
-        torch_dtype=torch.bfloat16,
-        load_ema_to_reg=args.load_ema,
-        load_prompt_refiner=False,  # Disable prompt refiner for GR00T
-    )
+    if args.use_lora:
+        pipe = Video2WorldPipeline.from_config(
+            config=config,
+            dit_path="",
+            device="cuda",
+            torch_dtype=torch.bfloat16,
+            load_prompt_refiner=False,
+        )
+        pipe.dit = add_lora_to_model(
+            pipe.dit,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_target_modules,
+            init_lora_weights=args.init_lora_weights,
+        )
+        if dit_path:
+            log.info(f"Loading LoRA checkpoint from: {dit_path}")
+            state_dict = load_state_dict(dit_path)
+            state_dict_dit = {}
+            state_dict_ema = {}
+            for k, v in state_dict.items():
+                if k.startswith("net."):
+                    state_dict_dit[k[4:]] = v
+                elif k.startswith("net_ema."):
+                    state_dict_ema[k[8:]] = v
+            weights_to_load = state_dict_ema if args.load_ema and state_dict_ema else state_dict_dit
+            pipe.dit.load_state_dict(weights_to_load, strict=False, assign=True)
+            del state_dict, state_dict_dit, state_dict_ema
+    else:
+        pipe = Video2WorldPipeline.from_config(
+            config=config,
+            dit_path=dit_path,
+            device="cuda",
+            torch_dtype=torch.bfloat16,
+            load_ema_to_reg=args.load_ema,
+            load_prompt_refiner=False,  # Disable prompt refiner for GR00T
+        )
 
     return pipe
 
@@ -244,6 +348,7 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
         with open(args.batch_input_json) as f:
             batch_inputs = json.load(f)
 
+        seeds = args.seeds if args.seeds else list(range(args.num_generations))
         for idx, item in enumerate(tqdm(batch_inputs)):
             input_video = item.get("input_video", "")
             prompt = item.get("prompt", "")
@@ -253,31 +358,49 @@ def generate_video(args: argparse.Namespace, pipe: Video2WorldPipeline) -> None:
                 log.warning(f"Skipping item {idx}: Missing input_video or prompt")
                 continue
 
-            process_single_generation(
-                pipe=pipe,
-                input_path=input_video,
-                prompt=prompt,
-                output_path=output_video,
-                negative_prompt=args.negative_prompt,
-                aspect_ratio=args.aspect_ratio,
-                num_conditional_frames=args.num_conditional_frames,
-                guidance=args.guidance,
-                seed=args.seed,
-                prompt_prefix=args.prompt_prefix,
-            )
+            for seed in seeds:
+                output_path = (
+                    f"{Path(output_video).with_suffix('')}_pipeline_{args.pipeline_seed}_seed_{seed}.mp4"
+                )
+                process_single_generation(
+                    pipe=pipe,
+                    input_path=input_video,
+                    prompt=prompt,
+                    output_path=output_path,
+                    negative_prompt=args.negative_prompt,
+                    aspect_ratio=args.aspect_ratio,
+                    num_conditional_frames=args.num_conditional_frames,
+                    guidance=args.guidance,
+                    seed=seed,
+                    prompt_prefix=args.prompt_prefix,
+                )
     else:
-        process_single_generation(
-            pipe=pipe,
-            input_path=args.input_path,
-            prompt=args.prompt,
-            output_path=args.save_path,
-            negative_prompt=args.negative_prompt,
-            aspect_ratio=args.aspect_ratio,
-            num_conditional_frames=args.num_conditional_frames,
-            guidance=args.guidance,
-            seed=args.seed,
-            prompt_prefix=args.prompt_prefix,
-        )
+        input_paths = args.input_paths
+        save_paths = args.save_paths
+        prompts = args.prompts
+        if not (len(input_paths) == len(save_paths) == len(prompts)):
+            raise ValueError("Number of input paths, save paths, and prompts must match")
+
+        seeds = args.seeds if args.seeds else list(range(args.num_generations))
+        for seed in seeds:
+            for input_path, prompt, save_path in zip(
+                input_paths, prompts, save_paths, strict=True
+            ):
+                output_path = (
+                    f"{Path(save_path).with_suffix('')}_pipeline_{args.pipeline_seed}_seed_{seed}.mp4"
+                )
+                process_single_generation(
+                    pipe=pipe,
+                    input_path=input_path,
+                    prompt=prompt,
+                    output_path=output_path,
+                    negative_prompt=args.negative_prompt,
+                    aspect_ratio=args.aspect_ratio,
+                    num_conditional_frames=args.num_conditional_frames,
+                    guidance=args.guidance,
+                    seed=seed,
+                    prompt_prefix=args.prompt_prefix,
+                )
 
     return
 

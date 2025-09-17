@@ -36,7 +36,7 @@ cs = ConfigStore.instance()
 # multiview_contact_rich_16fps_text_conditioned_train video dataset
 multiview_contact_rich_16fps_text_conditioned_train_video_dataset = L(Dataset)(
     dataset_dir="datasets/multiview_contact_rich_16fps_text_conditioned_train",
-    num_frames=85, # corresponds to state_t=22; (22-1)*4 + 1 = 85
+    num_frames=61, # corresponds to state_t=16; (16-1)*4 + 1 = 61
     video_size=(480, 640), # divisble by 16
 )
 
@@ -61,10 +61,10 @@ finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train =
     ],
     model=dict(
         config=dict(
-            fsdp_shard_size=32,
+            fsdp_shard_size=8,
             pipe_config=dict(
                 guardrail_config=dict(enabled=False),
-                state_t=22, # corresponds to num_frames=85; (22-1)*4 + 1 = 85
+                state_t=16, # corresponds to num_frames=61; (16-1)*4 + 1 = 61
             ),
         )
     ),
@@ -78,7 +78,7 @@ finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train =
         cycle_lengths=[100_000],
     ),
     model_parallel=dict(
-        context_parallel_size=2,
+        context_parallel_size=8,
     ),
     job=dict(
         project="posttraining",
@@ -93,7 +93,7 @@ finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train =
         ),
     ),
     checkpoint=dict(
-        save_iter=200,
+        save_iter=1000,
     ),
 )
 

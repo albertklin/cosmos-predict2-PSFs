@@ -120,6 +120,8 @@ my16fps_train_dataloader = L(DataLoader)(
     sampler=L(get_sampler)(dataset=my16fps_train_dataset),
     batch_size=1,
     drop_last=True,
+    num_workers=8,
+    pin_memory=True,
 )
 
 my16fps_val_dataloader = L(DataLoader)(
@@ -127,6 +129,8 @@ my16fps_val_dataloader = L(DataLoader)(
     sampler=L(get_sampler)(dataset=my16fps_val_dataset),
     batch_size=1,
     drop_last=True,
+    num_workers=8,
+    pin_memory=True,
 )
 
 

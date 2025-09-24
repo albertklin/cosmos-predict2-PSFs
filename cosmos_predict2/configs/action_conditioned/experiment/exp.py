@@ -51,11 +51,11 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
         {"override /optimizer": "fusedadamw"},
         {"override /ckpt_type": "standard"},
         {"override /dataloader_train": "my16fps_action_train"},
-        {"override /dataloader_val": "my16fps_action_val"},
         "_self_",
     ],
     model=dict(
         config=dict(
+            fsdp_shard_size=8,
             model_manager_config=dict(
                 dit_path="./checkpoints/finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train.pt",
             ),

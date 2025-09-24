@@ -63,7 +63,6 @@ class ActionConditionedDataset(Dataset):
         load_action=True,
         mode="train",
         output_fps=4,
-        pad_to_length=None,
     ):
         """Dataset class for loading 3D robot action-conditioned data.
 
@@ -90,10 +89,6 @@ class ActionConditionedDataset(Dataset):
             mode (str, optional): Dataset mode - 'train', 'val' or 'test'. Defaults to 'train'.
             output_fps (int, optional): Frames-per-second metadata stored alongside each
                 sample. Defaults to 4 to match the Bridge dataset recipe.
-            pad_to_length (int | None, optional): If provided, duplicate the final frame and
-                append zero-valued actions until the sequence reaches ``pad_to_length`` frames.
-                This is useful for aligning raw frame counts with tokenizer expectations (e.g.,
-                ensuring 1 + 4k frames for the VAE). Defaults to ``None``.
 
         The dataset loads robot trajectories and computes:
         - RGB video frames from specified camera views
@@ -129,7 +124,6 @@ class ActionConditionedDataset(Dataset):
         self.sequence_length = num_frames
         self.normalize = normalize
         self.output_fps = output_fps
-        self.pad_to_length = pad_to_length
         self.pre_encode = pre_encode
         self.load_t5_embeddings = load_t5_embeddings
         self.load_action = load_action
@@ -363,36 +357,7 @@ class ActionConditionedDataset(Dataset):
             else:
                 video, cam_id = self._get_obs(label, frame_ids, cam_id, pre_encode=False)
                 video = video.permute(1, 0, 2, 3)  # Rearrange from [T, C, H, W] to [C, T, H, W]
-                video = video.to(dtype=torch.uint8)
-
-                if self.pad_to_length is not None:
-                    current_frames = video.shape[1]
-                    if current_frames > self.pad_to_length:
-                        raise ValueError(
-                            f"Video has {current_frames} frames but pad_to_length={self.pad_to_length}."
-                        )
-                    if current_frames < self.pad_to_length:
-                        pad_frames = self.pad_to_length - current_frames
-                        last_frame = video[:, -1:, :, :]
-                        pad_video = last_frame.repeat(1, pad_frames, 1, 1)
-                        video = torch.cat([video, pad_video], dim=1)
-
-                        if self.load_action:
-                            target_action_steps = self.pad_to_length - 1
-                            current_action_steps = data["action"].shape[0]
-                            if current_action_steps > target_action_steps:
-                                raise ValueError(
-                                    "Padded video length is shorter than existing action sequence."
-                                )
-                            if current_action_steps < target_action_steps:
-                                pad_actions = torch.zeros(
-                                    target_action_steps - current_action_steps,
-                                    data["action"].shape[1],
-                                    dtype=data["action"].dtype,
-                                )
-                                data["action"] = torch.cat([data["action"], pad_actions], dim=0)
-
-                data["video"] = video
+                data["video"] = video.to(dtype=torch.uint8)
 
             data["annotation_file"] = ann_file
 
@@ -413,7 +378,7 @@ class ActionConditionedDataset(Dataset):
             data["t5_text_mask"] = torch.ones(CosmosTextEncoderConfig.NUM_TOKENS, dtype=torch.int64).cuda()
             data["fps"] = self.output_fps
             data["image_size"] = 256 * torch.ones(4).cuda()  # TODO: Does this matter?
-            data["num_frames"] = data["video"].shape[1]
+            data["num_frames"] = self.sequence_length
             data["padding_mask"] = torch.zeros(1, 256, 256).cuda()
 
             return data

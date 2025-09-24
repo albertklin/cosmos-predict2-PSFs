@@ -33,24 +33,24 @@ def get_sampler(dataset):
 
 cs = ConfigStore.instance()
 
-# multiview_contact_rich_16fps_text_conditioned_train video dataset
-multiview_contact_rich_16fps_text_conditioned_train_video_dataset = L(Dataset)(
-    dataset_dir="datasets/multiview_contact_rich_16fps_text_conditioned_train",
+# compview_contact_rich_16fps_text_conditioned_train video dataset
+compview_contact_rich_16fps_text_conditioned_train_video_dataset = L(Dataset)(
+    dataset_dir="datasets/compview_contact_rich_16fps_text_conditioned_train",
     num_frames=61, # corresponds to state_t=16; (16-1)*4 + 1 = 61
     video_size=(480, 640), # divisble by 16
 )
 
 dataloader_video_train = L(DataLoader)(
-    dataset=multiview_contact_rich_16fps_text_conditioned_train_video_dataset,
-    sampler=L(get_sampler)(dataset=multiview_contact_rich_16fps_text_conditioned_train_video_dataset),
+    dataset=compview_contact_rich_16fps_text_conditioned_train_video_dataset,
+    sampler=L(get_sampler)(dataset=compview_contact_rich_16fps_text_conditioned_train_video_dataset),
     batch_size=1,
     drop_last=True,
     num_workers=8,
     pin_memory=True,
 )
 
-# torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train --config=cosmos_predict2/configs/base/config.py -- experiment=finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train
-finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train = dict(
+# torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train --config=cosmos_predict2/configs/base/config.py -- experiment=finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train
+finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train = dict(
     defaults=[
         {"override /model": "predict2_video2world_fsdp_14b"},
         {"override /optimizer": "fusedadamw"},
@@ -83,7 +83,7 @@ finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train =
     job=dict(
         project="posttraining",
         group="video2world",
-        name="14b_multiview_contact_rich_16fps_text_conditioned_train",
+        name="14b_compview_contact_rich_16fps_text_conditioned_train",
     ),
     dataloader_train=dataloader_video_train,
     trainer=dict(
@@ -98,8 +98,8 @@ finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train =
 )
 
 for _item in [
-    # 14b, multiview_contact_rich_16fps_text_conditioned_train
-    finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train,
+    # 14b, compview_contact_rich_16fps_text_conditioned_train
+    finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train,
 ]:
     # Get the experiment name from the global variable, e.g. exp01_wan_lora -> experiment_name = "exp01_wan_lora"
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]  # noqa: RUF015

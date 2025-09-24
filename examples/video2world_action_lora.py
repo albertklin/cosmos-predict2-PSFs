@@ -417,24 +417,6 @@ def read_first_frame(video_path):
     return video[0]  # Return first frame as numpy array
 
 
-def _find_checkpoint_config_path(dit_path: str) -> Optional[Path]:
-    if not dit_path:
-        return None
-
-    checkpoint_path = Path(dit_path)
-    search_dirs = {
-        checkpoint_path.parent,
-        checkpoint_path.parent / "config",
-    }
-
-    for directory in list(search_dirs):
-        for candidate_name in ("config.yaml", "config.yml"):
-            candidate_path = directory / candidate_name
-            if candidate_path.is_file():
-                return candidate_path
-    return None
-
-
 def _extract_action_dim_from_config(net_cfg) -> Optional[int]:
     if net_cfg is None:
         return None
@@ -455,27 +437,6 @@ def determine_expected_action_dim(
     pipe: Video2WorldActionConditionedPipeline, dit_path: str
 ) -> int:
     """Infer the flattened action dimension expected by the pipeline."""
-
-    config_path = _find_checkpoint_config_path(dit_path)
-    if config_path is not None:
-        try:
-            cfg = LazyConfig.load(str(config_path))
-            if "model" in cfg:
-                model_cfg = cfg["model"]
-                if "config" in model_cfg:
-                    model_inner = model_cfg["config"]
-                    pipe_cfg = model_inner.get("pipe_config")
-                    if pipe_cfg is not None:
-                        action_dim = _extract_action_dim_from_config(pipe_cfg.get("net"))
-                        if action_dim is not None:
-                            log.info(
-                                "Loaded action_dim=%d from %s", action_dim, config_path
-                            )
-                            return action_dim
-        except Exception as exc:  # noqa: BLE001 - fall back to pipe config
-            log.warning(
-                "Failed to read action_dim from %s: %s", config_path, exc
-            )
 
     action_dim = _extract_action_dim_from_config(getattr(pipe.config, "net", None))
     if action_dim is not None:
@@ -589,7 +550,7 @@ def process_single_generation(
             )
 
         log.info(
-            "Using teacher forcing with interval size of %d action steps", teacher_forcing_interval
+            f"Using teacher forcing with interval size of {teacher_forcing_interval} action steps"
         )
 
         video_chunks = []
@@ -603,26 +564,23 @@ def process_single_generation(
 
         remainder = num_action_steps % chunk_size
         if remainder != 0:
-            log.warning(
-                "Dropping %d trailing action steps that do not fill a complete chunk",
-                remainder,
-            )
+            log.warning(f"Dropping {remainder} trailing action steps that do not fill a complete chunk")
 
         last_generated_frame: Optional[np.ndarray] = None
         for start in range(0, num_action_steps - chunk_size + 1, chunk_size):
             end = start + chunk_size
+            if end > num_action_steps:
+                log.info("Reached end of actions")
+                break
+
             chunk_actions = actions[:, start:end]
 
             use_ground_truth = (start % teacher_forcing_interval) == 0
             if use_ground_truth:
                 frame_idx = min(start, ground_truth_video.shape[0] - 1)
                 if frame_idx != start:
-                    log.warning(
-                        "Teacher forcing start index %d exceeds available frames (%d); using frame %d",
-                        start,
-                        ground_truth_video.shape[0],
-                        frame_idx,
-                    )
+                    log.warning(f"Teacher forcing start index {start} exceeds "
+                    f"available frames ({ground_truth_video.shape[0]}); using frame {frame_idx}")
                 chunk_first_frame = np.broadcast_to(
                     ground_truth_video[frame_idx], first_frame.shape
                 )
@@ -642,7 +600,7 @@ def process_single_generation(
                 seed=seed + start,
                 prompt="",
                 negative_prompt=negative_prompt,
-            )
+            ) # B x C x T x H x W
             print(f"Inference time: {time.time() - start_time:.2f} s")
             video_chunks.append(chunk_video)
             chunk_grounding_flags.append(use_ground_truth)
@@ -656,9 +614,9 @@ def process_single_generation(
             for idx, chunk in enumerate(video_chunks[1:], start=1):
                 grounded = chunk_grounding_flags[idx]
                 if grounded:
-                    teacher_frame_indices.append(total_frames)
-                    video = torch.cat([video, chunk], dim=2)
-                    total_frames += chunk.shape[2]
+                    teacher_frame_indices.append(total_frames-1)
+                    video = torch.cat([video[:, :, :-1], chunk], dim=2)
+                    total_frames += chunk.shape[2] - 1
                 else:
                     video = torch.cat([video, chunk[:, :, 1:]], dim=2)
                     total_frames += chunk.shape[2] - 1
@@ -683,7 +641,7 @@ def process_single_generation(
                 seed=seed+i,
                 prompt="",
                 negative_prompt=negative_prompt,
-            )
+            ) # B x C x T x H x W
             print(f"Inference time: {time.time() - start_time:.2f} s")
             first_frame = tensor_last_frame_to_numpy(video)
             video_chunks.append(video)

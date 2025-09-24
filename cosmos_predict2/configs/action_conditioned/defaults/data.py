@@ -66,7 +66,7 @@ my16fps_train_dataset = L(ActionConditionedDataset)(
     test_annotation_path=os.path.join(my16fps_base_path, "annotation/test"),
     video_path=my16fps_base_path,
     sequence_interval=1,
-    num_frames=49,
+    num_frames=61,
     cam_ids=[0],
     accumulate_action=False,
     video_size=[480, 640],
@@ -81,7 +81,7 @@ my16fps_val_dataset = L(ActionConditionedDataset)(
     test_annotation_path=os.path.join(my16fps_base_path, "annotation/test"),
     video_path=my16fps_base_path,
     sequence_interval=1,
-    num_frames=49,
+    num_frames=61,
     cam_ids=[0],
     accumulate_action=False,
     video_size=[480, 640],
@@ -120,8 +120,6 @@ my16fps_train_dataloader = L(DataLoader)(
     sampler=L(get_sampler)(dataset=my16fps_train_dataset),
     batch_size=1,
     drop_last=True,
-    num_workers=8,
-    pin_memory=True,
 )
 
 my16fps_val_dataloader = L(DataLoader)(
@@ -129,8 +127,6 @@ my16fps_val_dataloader = L(DataLoader)(
     sampler=L(get_sampler)(dataset=my16fps_val_dataset),
     batch_size=1,
     drop_last=True,
-    num_workers=8,
-    pin_memory=True,
 )
 
 

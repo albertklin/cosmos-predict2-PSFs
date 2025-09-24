@@ -62,6 +62,7 @@ class ActionConditionedDataset(Dataset):
         load_t5_embeddings=False,
         load_action=True,
         mode="train",
+        output_fps=4,
     ):
         """Dataset class for loading 3D robot action-conditioned data.
 
@@ -86,6 +87,8 @@ class ActionConditionedDataset(Dataset):
             load_t5_embeddings (bool, optional): Whether to load T5 embeddings. Defaults to False.
             load_action (bool, optional): Whether to load actions. Defaults to True.
             mode (str, optional): Dataset mode - 'train', 'val' or 'test'. Defaults to 'train'.
+            output_fps (int, optional): Frames-per-second metadata stored alongside each
+                sample. Defaults to 4 to match the Bridge dataset recipe.
 
         The dataset loads robot trajectories and computes:
         - RGB video frames from specified camera views
@@ -120,6 +123,7 @@ class ActionConditionedDataset(Dataset):
         self.mode = mode
         self.sequence_length = num_frames
         self.normalize = normalize
+        self.output_fps = output_fps
         self.pre_encode = pre_encode
         self.load_t5_embeddings = load_t5_embeddings
         self.load_action = load_action
@@ -353,7 +357,9 @@ class ActionConditionedDataset(Dataset):
             else:
                 video, cam_id = self._get_obs(label, frame_ids, cam_id, pre_encode=False)
                 video = video.permute(1, 0, 2, 3)  # Rearrange from [T, C, H, W] to [C, T, H, W]
-                data["video"] = video.to(dtype=torch.uint8)
+                video = video.to(dtype=torch.uint8)
+
+                data["video"] = video
 
             data["annotation_file"] = ann_file
 
@@ -372,9 +378,9 @@ class ActionConditionedDataset(Dataset):
                     CosmosTextEncoderConfig.NUM_TOKENS, CosmosTextEncoderConfig.EMBED_DIM, dtype=torch.bfloat16
                 ).cuda()
             data["t5_text_mask"] = torch.ones(CosmosTextEncoderConfig.NUM_TOKENS, dtype=torch.int64).cuda()
-            data["fps"] = 4
+            data["fps"] = self.output_fps
             data["image_size"] = 256 * torch.ones(4).cuda()  # TODO: Does this matter?
-            data["num_frames"] = self.sequence_length
+            data["num_frames"] = data["video"].shape[1]
             data["padding_mask"] = torch.zeros(1, 256, 256).cuda()
 
             return data

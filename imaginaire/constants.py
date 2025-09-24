@@ -174,8 +174,8 @@ def get_cosmos_predict2_multiview_checkpoint(
     return f"{model_dir}/model-{resolution}p-{fps}fps-{views}views-{frames}frames.pt"
 
 
-CosmosPredict2ActionConditionedModelSize = Literal["2B"]
-CosmosPredict2ActionConditionedResolution = Literal["720"]
+CosmosPredict2ActionConditionedModelSize = Literal["2B", "14B"]
+CosmosPredict2ActionConditionedResolution = Literal["480", "720"]
 CosmosPredict2ActionConditionedFPS = Literal[16]
 
 

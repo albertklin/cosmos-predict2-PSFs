@@ -40,6 +40,7 @@ bridge_train_dataset = L(ActionConditionedDataset)(
     video_size=[480, 640],
     val_start_frame_interval=1,
     mode="train",
+    output_fps=4,
 )
 
 bridge_val_dataset = L(ActionConditionedDataset)(
@@ -54,6 +55,39 @@ bridge_val_dataset = L(ActionConditionedDataset)(
     video_size=[480, 640],
     val_start_frame_interval=1,
     mode="val",
+    output_fps=4,
+)
+
+
+my16fps_base_path = "./datasets/my_16fps_action/"
+my16fps_train_dataset = L(ActionConditionedDataset)(
+    train_annotation_path=os.path.join(my16fps_base_path, "annotation/train"),
+    val_annotation_path=os.path.join(my16fps_base_path, "annotation/val"),
+    test_annotation_path=os.path.join(my16fps_base_path, "annotation/test"),
+    video_path=my16fps_base_path,
+    sequence_interval=1,
+    num_frames=49,
+    cam_ids=[0],
+    accumulate_action=False,
+    video_size=[480, 640],
+    val_start_frame_interval=1,
+    mode="train",
+    output_fps=16,
+)
+
+my16fps_val_dataset = L(ActionConditionedDataset)(
+    train_annotation_path=os.path.join(my16fps_base_path, "annotation/train"),
+    val_annotation_path=os.path.join(my16fps_base_path, "annotation/val"),
+    test_annotation_path=os.path.join(my16fps_base_path, "annotation/test"),
+    video_path=my16fps_base_path,
+    sequence_interval=1,
+    num_frames=49,
+    cam_ids=[0],
+    accumulate_action=False,
+    video_size=[480, 640],
+    val_start_frame_interval=1,
+    mode="val",
+    output_fps=16,
 )
 
 
@@ -81,6 +115,20 @@ bridge_val_dataloader = L(DataLoader)(
     drop_last=True,
 )
 
+my16fps_train_dataloader = L(DataLoader)(
+    dataset=my16fps_train_dataset,
+    sampler=L(get_sampler)(dataset=my16fps_train_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
+my16fps_val_dataloader = L(DataLoader)(
+    dataset=my16fps_val_dataset,
+    sampler=L(get_sampler)(dataset=my16fps_val_dataset),
+    batch_size=1,
+    drop_last=True,
+)
+
 
 def register_training_and_val_data_action_conditioned():
     cs = ConfigStore.instance()
@@ -97,4 +145,16 @@ def register_training_and_val_data_action_conditioned():
         package="dataloader_val",
         name="bridge_val",
         node=bridge_val_dataloader,
+    )
+    cs.store(
+        group="dataloader_train",
+        package="dataloader_train",
+        name="my16fps_action_train",
+        node=my16fps_train_dataloader,
+    )
+    cs.store(
+        group="dataloader_val",
+        package="dataloader_val",
+        name="my16fps_action_val",
+        node=my16fps_val_dataloader,
     )

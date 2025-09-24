@@ -45,10 +45,49 @@ predict2_video2world_2b_action_conditioned_training = dict(
     ),
 )
 
+predict2_video2world_14b_action_conditioned_training_my16fps = dict(
+    defaults=[
+        {"override /model": "predict2_v2w_14b_action_conditioned_fsdp"},
+        {"override /optimizer": "fusedadamw"},
+        {"override /ckpt_type": "standard"},
+        {"override /dataloader_train": "my16fps_action_train"},
+        {"override /dataloader_val": "my16fps_action_val"},
+        "_self_",
+    ],
+    model=dict(
+        config=dict(
+            model_manager_config=dict(
+                dit_path="./checkpoints/finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train.pt",
+            ),
+            pipe_config=dict(
+                state_t=13,
+                resize_online=False,
+                net=dict(
+                    action_dim=7 * 48,
+                ),
+            ),
+        )
+    ),
+    job=dict(
+        group="action_conditioned",
+        name="predict2_video2world_14b_action_conditioned_my16fps_${now:%Y-%m-%d}_${now:%H-%M-%S}",
+    ),
+    model_parallel=dict(
+        context_parallel_size=8,
+    ),
+    dataloader_train=dict(
+        batch_size=1,
+    ),
+    trainer=dict(
+        distributed_parallelism="fsdp",
+    ),
+)
+
 
 for _item in [
     # predict2_video2world_2b
     predict2_video2world_2b_action_conditioned_training,
+    predict2_video2world_14b_action_conditioned_training_my16fps,
 ]:
     # Get the experiment name from the global variable, e.g. exp01_wan_lora -> experiment_name = "exp01_wan_lora"
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]  # noqa: RUF015

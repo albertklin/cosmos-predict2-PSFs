@@ -84,8 +84,9 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
     model_parallel=dict(
         context_parallel_size=8,
     ),
-    dataloader_train=my16fps_train_dataloader,
-    dataloader_val=my16fps_val_dataloader,
+    dataloader_train=dict(
+        batch_size=1,
+    ),
     trainer=dict(
         distributed_parallelism="fsdp",
     ),

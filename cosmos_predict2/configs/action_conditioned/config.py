@@ -204,7 +204,7 @@ _PREDICT2_ACTION_CONDITIONED_PIPELINE_14B = Video2WorldPipelineConfig(
     rectified_flow_t_scaling_factor=1.0,
     rectified_flow_loss_weight_uniform=True,
     resize_online=True,
-    resolution="480",
+    resolution="720",
     ema=L(EMAConfig)(enabled=False),
     sigma_conditional=0.0001,
     sigma_data=1.0,

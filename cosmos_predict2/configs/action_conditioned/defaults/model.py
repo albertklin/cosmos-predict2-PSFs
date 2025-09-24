@@ -38,6 +38,23 @@ _PREDICT2_V2W_2B_ACTION_CONDITIONED_FSDP_CONFIG = dict(
     ),
 )
 
+_PREDICT2_V2W_14B_ACTION_CONDITIONED_FSDP_CONFIG = dict(
+    trainer=dict(
+        distributed_parallelism="fsdp",
+    ),
+    model=L(Predict2Video2WorldActionConditionedModel)(
+        config=Predict2Video2WorldModelConfig(
+            pipe_config=get_cosmos_predict2_action_conditioned_pipeline(model_size="14B", resolution="720", fps=16),
+            model_manager_config=L(Predict2ModelManagerConfig)(
+                dit_path=get_cosmos_predict2_action_conditioned_checkpoint(model_size="14B", resolution="720", fps=16),
+                text_encoder_path="",
+            ),
+            fsdp_shard_size=8,
+        ),
+        _recursive_=False,
+    ),
+)
+
 
 def register_model_action_conditioned() -> None:
     cs = ConfigStore.instance()
@@ -47,4 +64,10 @@ def register_model_action_conditioned() -> None:
         package="_global_",
         name="predict2_v2w_2b_action_conditioned_fsdp",
         node=_PREDICT2_V2W_2B_ACTION_CONDITIONED_FSDP_CONFIG,
+    )
+    cs.store(
+        group="model",
+        package="_global_",
+        name="predict2_v2w_14b_action_conditioned_fsdp",
+        node=_PREDICT2_V2W_14B_ACTION_CONDITIONED_FSDP_CONFIG,
     )

@@ -20,12 +20,14 @@ import os
 import mediapy as mp
 import numpy as np
 from pathlib import Path
+from typing import Iterable, Optional
 
 # Set TOKENIZERS_PARALLELISM environment variable to avoid deadlocks with multiprocessing
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import torch
 from megatron.core import parallel_state
+from omegaconf import OmegaConf
 
 from cosmos_predict2.configs.action_conditioned.config import get_cosmos_predict2_action_conditioned_pipeline
 from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
@@ -297,6 +299,17 @@ def parse_args() -> argparse.Namespace:
         default=12,
         help="Chunk size",
     )
+    parser.add_argument(
+        "--use_teacher_forcing",
+        action="store_true",
+        help="Enable teacher forcing by grounding chunks on the ground-truth video",
+    )
+    parser.add_argument(
+        "--teacher_forcing_interval",
+        type=int,
+        default=12,
+        help="Number of action steps per chunk when using teacher forcing",
+    )
     parser.add_argument("--autoregressive", action="store_true", help="Use autoregressive mode")
     parser.add_argument("--guidance", type=float, default=7, help="Guidance value")
     parser.add_argument(
@@ -396,12 +409,123 @@ def setup_pipeline(args: argparse.Namespace):
             load_prompt_refiner=True,
         )
 
-    return pipe
+    return pipe, dit_path
 
 
 def read_first_frame(video_path):
     video = mp.read_video(video_path)  # Returns (T, H, W, C) numpy array
     return video[0]  # Return first frame as numpy array
+
+
+def _find_checkpoint_config_path(dit_path: str) -> Optional[Path]:
+    if not dit_path:
+        return None
+
+    checkpoint_path = Path(dit_path)
+    search_dirs = {
+        checkpoint_path.parent,
+        checkpoint_path.parent / "config",
+    }
+
+    for directory in list(search_dirs):
+        for candidate_name in ("config.yaml", "config.yml"):
+            candidate_path = directory / candidate_name
+            if candidate_path.is_file():
+                return candidate_path
+    return None
+
+
+def _extract_action_dim_from_config(net_cfg) -> Optional[int]:
+    if net_cfg is None:
+        return None
+    try:
+        net_dict = OmegaConf.to_container(net_cfg, resolve=True)
+    except Exception:  # noqa: BLE001 - best effort
+        return None
+
+    if isinstance(net_dict, dict) and "action_dim" in net_dict:
+        try:
+            return int(net_dict["action_dim"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def determine_expected_action_dim(
+    pipe: Video2WorldActionConditionedPipeline, dit_path: str
+) -> int:
+    """Infer the flattened action dimension expected by the pipeline."""
+
+    config_path = _find_checkpoint_config_path(dit_path)
+    if config_path is not None:
+        try:
+            cfg = LazyConfig.load(str(config_path))
+            if "model" in cfg:
+                model_cfg = cfg["model"]
+                if "config" in model_cfg:
+                    model_inner = model_cfg["config"]
+                    pipe_cfg = model_inner.get("pipe_config")
+                    if pipe_cfg is not None:
+                        action_dim = _extract_action_dim_from_config(pipe_cfg.get("net"))
+                        if action_dim is not None:
+                            log.info(
+                                "Loaded action_dim=%d from %s", action_dim, config_path
+                            )
+                            return action_dim
+        except Exception as exc:  # noqa: BLE001 - fall back to pipe config
+            log.warning(
+                "Failed to read action_dim from %s: %s", config_path, exc
+            )
+
+    action_dim = _extract_action_dim_from_config(getattr(pipe.config, "net", None))
+    if action_dim is not None:
+        return action_dim
+
+    if hasattr(pipe, "dit") and hasattr(pipe.dit, "action_embedder_B_D"):
+        embedder = pipe.dit.action_embedder_B_D
+        if hasattr(embedder, "fc1") and hasattr(embedder.fc1, "in_features"):
+            return int(embedder.fc1.in_features)
+
+    raise RuntimeError("Unable to determine the expected action_dim for the pipeline")
+
+
+def tensor_last_frame_to_numpy(video: torch.Tensor) -> np.ndarray:
+    frame = video[:, :, -1].permute(0, 2, 3, 1).cpu().numpy()
+    frame = ((frame / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
+    return frame
+
+
+def highlight_ground_truth_frames(
+    video: torch.Tensor, frame_indices: Iterable[int], border_thickness: int = 2
+) -> torch.Tensor:
+    """Highlight selected frames with a green border to indicate teacher forcing."""
+
+    if video is None or not isinstance(video, torch.Tensor):
+        return video
+
+    total_frames = video.shape[2]
+    if total_frames == 0:
+        return video
+
+    unique_indices = sorted({int(i) for i in frame_indices if 0 <= int(i) < total_frames})
+    if not unique_indices:
+        return video
+
+    height, width = video.shape[-2:]
+    thickness = max(1, min(border_thickness, height, width))
+
+    border_color = torch.tensor([-1.0, 1.0, -1.0], dtype=video.dtype, device=video.device).view(
+        1, -1, 1, 1
+    )
+
+    for frame_idx in unique_indices:
+        frame = video[:, :, frame_idx]
+        frame[:, :, :thickness, :] = border_color
+        frame[:, :, -thickness:, :] = border_color
+        frame[:, :, :, :thickness] = border_color
+        frame[:, :, :, -thickness:] = border_color
+
+    return video
 
 
 def process_single_generation(
@@ -414,16 +538,136 @@ def process_single_generation(
     seed,
     chunk_size,
     autoregressive,
+    use_teacher_forcing,
+    teacher_forcing_interval,
+    expected_action_dim,
 ):
     actions = get_action_sequence(input_annotation)
-    first_frame = read_first_frame(input_path)
+
+    ground_truth_video = None
+    if use_teacher_forcing:
+        ground_truth_video = mp.read_video(input_path)
+        if ground_truth_video.ndim != 4 or ground_truth_video.shape[0] == 0:
+            raise ValueError("Unable to read ground-truth video for teacher forcing")
+        first_frame = ground_truth_video[0]
+    else:
+        first_frame = read_first_frame(input_path)
 
     first_frame = np.broadcast_to(first_frame, (args.batch_size, *first_frame.shape))
     actions = np.broadcast_to(actions, (args.batch_size, *actions.shape))
 
+    per_action_dim = actions.shape[-1]
+    if expected_action_dim % per_action_dim != 0:
+        raise ValueError(
+            "Action feature dimension %d does not divide expected action_dim %d"
+            % (per_action_dim, expected_action_dim)
+        )
+
+    valid_chunk_size = expected_action_dim // per_action_dim
+    if chunk_size != valid_chunk_size:
+        raise ValueError(
+            (
+                "chunk_size=%d is incompatible with model action_dim=%d; expected %d actions per chunk"
+            )
+            % (chunk_size, expected_action_dim, valid_chunk_size)
+        )
+
+    chunk_size = valid_chunk_size
+
     log.info(f"Running Video2WorldPipeline\ninput: {input_path}")
 
-    if autoregressive:
+    if use_teacher_forcing:
+        if teacher_forcing_interval <= 0:
+            raise ValueError("teacher_forcing_interval must be a positive integer")
+
+        if teacher_forcing_interval % chunk_size != 0:
+            raise ValueError(
+                (
+                    "teacher_forcing_interval=%d must be a positive multiple of chunk_size=%d to respect action_dim=%d"
+                )
+                % (teacher_forcing_interval, chunk_size, expected_action_dim)
+            )
+
+        log.info(
+            "Using teacher forcing with interval size of %d action steps", teacher_forcing_interval
+        )
+
+        video_chunks = []
+        chunk_grounding_flags: list[bool] = []
+        num_action_steps = actions.shape[1]
+        if num_action_steps < chunk_size:
+            raise ValueError(
+                "Not enough action steps (%d) to form a single chunk of size %d"
+                % (num_action_steps, chunk_size)
+            )
+
+        remainder = num_action_steps % chunk_size
+        if remainder != 0:
+            log.warning(
+                "Dropping %d trailing action steps that do not fill a complete chunk",
+                remainder,
+            )
+
+        last_generated_frame: Optional[np.ndarray] = None
+        for start in range(0, num_action_steps - chunk_size + 1, chunk_size):
+            end = start + chunk_size
+            chunk_actions = actions[:, start:end]
+
+            use_ground_truth = (start % teacher_forcing_interval) == 0
+            if use_ground_truth:
+                frame_idx = min(start, ground_truth_video.shape[0] - 1)
+                if frame_idx != start:
+                    log.warning(
+                        "Teacher forcing start index %d exceeds available frames (%d); using frame %d",
+                        start,
+                        ground_truth_video.shape[0],
+                        frame_idx,
+                    )
+                chunk_first_frame = np.broadcast_to(
+                    ground_truth_video[frame_idx], first_frame.shape
+                )
+            else:
+                if last_generated_frame is None:
+                    raise RuntimeError(
+                        "Missing generated frame to seed teacher forcing continuation"
+                    )
+                chunk_first_frame = last_generated_frame
+
+            start_time = time.time()
+            chunk_video = pipe(
+                chunk_first_frame,
+                chunk_actions,
+                num_conditional_frames=1,
+                guidance=guidance,
+                seed=seed + start,
+                prompt="",
+                negative_prompt=negative_prompt,
+            )
+            print(f"Inference time: {time.time() - start_time:.2f} s")
+            video_chunks.append(chunk_video)
+            chunk_grounding_flags.append(use_ground_truth)
+            last_generated_frame = tensor_last_frame_to_numpy(chunk_video)
+
+        if video_chunks:
+            video = video_chunks[0]
+            total_frames = video.shape[2]
+            teacher_frame_indices = [0] if chunk_grounding_flags[0] else []
+
+            for idx, chunk in enumerate(video_chunks[1:], start=1):
+                grounded = chunk_grounding_flags[idx]
+                if grounded:
+                    teacher_frame_indices.append(total_frames)
+                    video = torch.cat([video, chunk], dim=2)
+                    total_frames += chunk.shape[2]
+                else:
+                    video = torch.cat([video, chunk[:, :, 1:]], dim=2)
+                    total_frames += chunk.shape[2] - 1
+
+            video = highlight_ground_truth_frames(video, teacher_frame_indices)
+        else:
+            video = None
+
+    elif autoregressive:
         log.info("Using autoregressive mode")
         video_chunks = []
         for i in range(0, actions.shape[1], chunk_size):
@@ -441,7 +685,7 @@ def process_single_generation(
                 negative_prompt=negative_prompt,
             )
             print(f"Inference time: {time.time() - start_time:.2f} s")
-            first_frame = ((video[:, :, -1].permute(0, 2, 3, 1).cpu().numpy() / 2 + 0.5).clip(0, 1) * 255).astype(np.uint8)
+            first_frame = tensor_last_frame_to_numpy(video)
             video_chunks.append(video)
         video = torch.cat([video_chunks[0]] + [chunk[:, :, 1:] for chunk in video_chunks[1:]], dim=2)
     else:
@@ -487,7 +731,11 @@ def generate_video(
     input_annotation: str,
     save_path: str,
     seed: int = 0,
+    expected_action_dim: int | None = None,
 ) -> None:
+    if expected_action_dim is None:
+        raise ValueError("expected_action_dim must be provided")
+
     process_single_generation(
         pipe=pipe,
         input_path=input_video,
@@ -498,6 +746,9 @@ def generate_video(
         seed=seed,
         chunk_size=args.chunk_size,
         autoregressive=args.autoregressive,
+        use_teacher_forcing=args.use_teacher_forcing,
+        teacher_forcing_interval=args.teacher_forcing_interval,
+        expected_action_dim=expected_action_dim,
     )
     return
 
@@ -513,7 +764,8 @@ def cleanup_distributed():
 if __name__ == "__main__":
     args = parse_args()
     try:
-        pipe = setup_pipeline(args)
+        pipe, dit_path = setup_pipeline(args)
+        expected_action_dim = determine_expected_action_dim(pipe, dit_path)
         input_videos = args.input_videos
         input_annotations = args.input_annotations
         save_paths = args.save_paths
@@ -536,6 +788,7 @@ if __name__ == "__main__":
                     input_annotation=input_annotations[j],
                     save_path=output_path,
                     seed=seed,
+                    expected_action_dim=expected_action_dim,
                 )
     finally:
         # Make sure to clean up the distributed environment

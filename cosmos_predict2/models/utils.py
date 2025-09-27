@@ -14,12 +14,15 @@
 # limitations under the License.
 
 import hashlib
+import json
 import os
+from collections import OrderedDict
 from contextlib import contextmanager
 
 import torch
 from safetensors.torch import load as safetensors_torch_load
 
+from imaginaire.utils import log
 from imaginaire.utils.easy_io import easy_io
 
 
@@ -81,30 +84,103 @@ def load_state_dict_from_folder(file_path, torch_dtype=None):
 
 
 def load_state_dict(file_path, torch_dtype=None):
+    fake_checkpoint = bool(os.environ.get("COSMOS_PREDICT2_FAKE_CHECKPOINT"))
     if file_path.endswith(".safetensors"):
-        return load_state_dict_from_safetensors(file_path, torch_dtype=torch_dtype)
+        return load_state_dict_from_safetensors(
+            file_path,
+            torch_dtype=torch_dtype,
+            fake_checkpoint=fake_checkpoint,
+        )
     else:
-        return load_state_dict_from_bin(file_path, torch_dtype=torch_dtype)
+        return load_state_dict_from_bin(
+            file_path,
+            torch_dtype=torch_dtype,
+            fake_checkpoint=fake_checkpoint,
+        )
 
 
-def load_state_dict_from_safetensors(file_path, torch_dtype=None):
+def load_state_dict_from_safetensors(file_path, torch_dtype=None, fake_checkpoint: bool = False):
     backend_args = None
-    state_dict = {}
+    if fake_checkpoint:
+        log.warning(
+            "COSMOS_PREDICT2_FAKE_CHECKPOINT is set; using safetensors metadata from '%s' without loading weights.",
+            file_path,
+        )
+        return _build_fake_state_dict_from_safetensors(file_path, torch_dtype=torch_dtype)
+
     byte_stream = easy_io.load(file_path, backend_args=backend_args, file_format="byte")
     state_dict = safetensors_torch_load(byte_stream)
     return state_dict
 
 
-def load_state_dict_from_bin(file_path, torch_dtype=None):
+def load_state_dict_from_bin(file_path, torch_dtype=None, fake_checkpoint: bool = False):
     backend_args = None
+    map_location = "meta" if fake_checkpoint else "cpu"
+    if fake_checkpoint:
+        log.warning(
+            "COSMOS_PREDICT2_FAKE_CHECKPOINT is set; loading metadata for '%s' on the meta device.",
+            file_path,
+        )
     state_dict = easy_io.load(
-        file_path, backend_args=backend_args, file_format="pt", map_location="cpu", weights_only=False
+        file_path,
+        backend_args=backend_args,
+        file_format="pt",
+        map_location=map_location,
+        weights_only=False,
     )
     if torch_dtype is not None:
         for i in state_dict:
             if isinstance(state_dict[i], torch.Tensor):
                 state_dict[i] = state_dict[i].to(torch_dtype)
     return state_dict
+
+
+def _build_fake_state_dict_from_safetensors(file_path: str, torch_dtype=None):
+    try:
+        with open(file_path, "rb") as f:
+            header_size = int.from_bytes(f.read(8), "little")
+            header = json.loads(f.read(header_size).decode("utf-8"))
+    except (OSError, ValueError):
+        byte_stream = easy_io.load(file_path, backend_args=None, file_format="byte")
+        header_size = int.from_bytes(byte_stream[:8], "little")
+        header = json.loads(byte_stream[8 : 8 + header_size].decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        log.error(
+            "Failed to decode safetensors metadata from '%s' under fake checkpoint mode: %s", file_path, exc
+        )
+        return {}
+
+    tensors = header.get("tensors", {})
+    fake_state = OrderedDict()
+    for name, tensor_info in tensors.items():
+        dtype_key = tensor_info.get("dtype")
+        shape = tuple(tensor_info.get("shape", ()))
+        dtype = _SAFE_TORCH_DTYPES.get(dtype_key, torch.float32)
+        if dtype_key not in _SAFE_TORCH_DTYPES:
+            log.warning(
+                "Unknown safetensors dtype '%s' for tensor '%s' in '%s'; defaulting to torch.float32.",
+                dtype_key,
+                name,
+                file_path,
+            )
+        if torch_dtype is not None:
+            dtype = torch_dtype
+        fake_state[name] = torch.empty(shape, device="meta", dtype=dtype)
+    return fake_state
+
+
+_SAFE_TORCH_DTYPES = {
+    "F16": torch.float16,
+    "F32": torch.float32,
+    "F64": torch.float64,
+    "BF16": torch.bfloat16,
+    "I8": torch.int8,
+    "I16": torch.int16,
+    "I32": torch.int32,
+    "I64": torch.int64,
+    "U8": torch.uint8,
+    "BOOL": torch.bool,
+}
 
 
 def search_for_embeddings(state_dict):

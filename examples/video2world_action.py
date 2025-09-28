@@ -42,6 +42,174 @@ from imaginaire.utils.io import save_image_or_video, save_text_prompts
 import time
 
 
+def add_lora_to_model(
+    model,
+    lora_rank=16,
+    lora_alpha=16,
+    lora_target_modules="q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
+    init_lora_weights=True,
+):
+    """Add LoRA adapters to a model using the PEFT library."""
+    from peft import LoraConfig, inject_adapter_in_model
+
+    lora_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        init_lora_weights=init_lora_weights,
+        target_modules=lora_target_modules.split(","),
+    )
+    model = inject_adapter_in_model(lora_config, model)
+    # Upcast LoRA parameters to fp32 for better stability
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.to(torch.float32)
+    return model
+
+
+def setup_lora_pipeline(
+    config, dit_path: str, args: argparse.Namespace
+):
+    """Set up an action-conditioned pipeline with LoRA support."""
+    from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
+    from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
+    from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
+    from cosmos_predict2.schedulers.rectified_flow_scheduler import (
+        RectifiedFlowAB2Scheduler,
+    )
+    from imaginaire.lazy_config import instantiate
+    from imaginaire.utils.ema import FastEmaModelUpdater
+
+    pipe = Video2WorldActionConditionedPipeline(device="cuda", torch_dtype=torch.bfloat16)
+    pipe.config = config
+    pipe.precision = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }[config.precision]
+    pipe.tensor_kwargs = {"device": "cuda", "dtype": pipe.precision}
+    log.warning(f"precision {pipe.precision}")
+
+    pipe.sigma_data = config.sigma_data
+    pipe.setup_data_key()
+
+    pipe.scheduler = RectifiedFlowAB2Scheduler(
+        sigma_min=config.timestamps.t_min,
+        sigma_max=config.timestamps.t_max,
+        order=config.timestamps.order,
+        t_scaling_factor=config.rectified_flow_t_scaling_factor,
+    )
+    pipe.scaling = RectifiedFlowScaling(
+        pipe.sigma_data,
+        config.rectified_flow_t_scaling_factor,
+        config.rectified_flow_loss_weight_uniform,
+    )
+
+    pipe.tokenizer = instantiate(config.tokenizer)
+    assert pipe.tokenizer.latent_ch == pipe.config.state_ch, (
+        f"latent_ch {pipe.tokenizer.latent_ch} != state_shape {pipe.config.state_ch}"
+    )
+
+    pipe.text_encoder = None
+    pipe.conditioner = instantiate(config.conditioner)
+    assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
+        "conditioner should not have learnable parameters"
+    )
+
+    pipe.prompt_refiner = CosmosReason1(
+        checkpoint_dir=config.prompt_refiner_config.checkpoint_dir,
+        offload_model_to_cpu=config.prompt_refiner_config.offload_model_to_cpu,
+        enabled=config.prompt_refiner_config.enabled,
+    )
+    if config.guardrail_config.enabled:
+        from cosmos_predict2.auxiliary.guardrail.common import presets as guardrail_presets
+
+        pipe.text_guardrail_runner = guardrail_presets.create_text_guardrail_runner(
+            config.guardrail_config.checkpoint_dir,
+            config.guardrail_config.offload_model_to_cpu,
+        )
+        pipe.video_guardrail_runner = guardrail_presets.create_video_guardrail_runner(
+            config.guardrail_config.checkpoint_dir,
+            config.guardrail_config.offload_model_to_cpu,
+        )
+    else:
+        pipe.text_guardrail_runner = None
+        pipe.video_guardrail_runner = None
+
+    log.info("Initializing DiT model...")
+    with init_weights_on_device():
+        dit_config = config.net
+        pipe.dit = instantiate(dit_config).eval()
+
+    log.info("Adding LoRA adapters to DiT model...")
+    pipe.dit = add_lora_to_model(
+        pipe.dit,
+        lora_rank=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_target_modules=args.lora_target_modules,
+        init_lora_weights=args.init_lora_weights,
+    )
+
+    if config.ema.enabled:
+        log.info("Setting up EMA model with LoRA adapters...")
+        pipe.dit_ema = instantiate(dit_config).eval()
+        pipe.dit_ema.requires_grad_(False)
+        pipe.dit_ema = add_lora_to_model(
+            pipe.dit_ema,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_target_modules=args.lora_target_modules,
+            init_lora_weights=args.init_lora_weights,
+        )
+        pipe.dit_ema_worker = FastEmaModelUpdater()
+        s = config.ema.rate
+        pipe.ema_exp_coefficient = np.roots([1, 7, 16 - s**-2, 12 - s**-2]).real.max()
+        pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
+
+    if dit_path:
+        log.info(f"Loading LoRA checkpoint from {dit_path}")
+        state_dict = load_state_dict(dit_path)
+        state_dict_dit = {}
+        state_dict_ema = {}
+        for k, v in state_dict.items():
+            if k.startswith("net."):
+                state_dict_dit[k[4:]] = v
+            elif k.startswith("net_ema."):
+                state_dict_ema[k[8:]] = v
+        missing = pipe.dit.load_state_dict(state_dict_dit, strict=False, assign=True)
+        if missing.missing_keys:
+            log.warning(f"Missing keys in regular model: {missing.missing_keys}")
+        if missing.unexpected_keys:
+            log.warning(f"Unexpected keys in regular model: {missing.unexpected_keys}")
+        if config.ema.enabled and state_dict_ema:
+            missing_ema = pipe.dit_ema.load_state_dict(state_dict_ema, strict=False, assign=True)
+            if missing_ema.missing_keys:
+                log.warning(f"Missing keys in EMA model: {missing_ema.missing_keys}")
+            if missing_ema.unexpected_keys:
+                log.warning(f"Unexpected keys in EMA model: {missing_ema.unexpected_keys}")
+        del state_dict, state_dict_dit, state_dict_ema
+        log.success(f"Successfully loaded LoRA checkpoint from {dit_path}")
+    else:
+        log.warning("No checkpoint path provided, using random weights")
+
+    pipe.dit = pipe.dit.to(device="cuda", dtype=torch.bfloat16)
+    if config.ema.enabled:
+        pipe.dit_ema = pipe.dit_ema.to(device="cuda", dtype=torch.bfloat16)
+    torch.cuda.empty_cache()
+
+    if parallel_state.is_initialized():
+        pipe.data_parallel_size = parallel_state.get_data_parallel_world_size()
+    else:
+        pipe.data_parallel_size = 1
+
+    total_params = sum(p.numel() for p in pipe.dit.parameters())
+    trainable_params = sum(p.numel() for p in pipe.dit.parameters() if p.requires_grad)
+    log.info(f"Total parameters: {total_params:,}")
+    log.info(f"Trainable LoRA parameters: {trainable_params:,}")
+    log.info(f"LoRA parameter ratio: {trainable_params / total_params * 100:.2f}%")
+
+    return pipe
+
+
 def get_action_sequence(annotation_path):
     with open(annotation_path) as file:
         data = json.load(file)
@@ -68,6 +236,36 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="Custom path to the DiT model checkpoint for post-trained models.",
+    )
+    # LoRA-specific arguments
+    parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="Enable LoRA inference mode",
+    )
+    parser.add_argument(
+        "--lora_rank",
+        type=int,
+        default=16,
+        help="Rank of the LoRA adaptation",
+    )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=16,
+        help="Alpha parameter for LoRA",
+    )
+    parser.add_argument(
+        "--lora_target_modules",
+        type=str,
+        default="q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2",
+        help="Comma-separated list of target modules for LoRA",
+    )
+    parser.add_argument(
+        "--init_lora_weights",
+        action="store_true",
+        default=True,
+        help="Whether to initialize LoRA weights",
     )
     parser.add_argument(
         "--load_ema",
@@ -197,15 +395,19 @@ def setup_pipeline(args: argparse.Namespace):
 
     # Load models
     log.info(f"Initializing Video2WorldPipeline with model size: {args.model_size}")
-    pipe = Video2WorldActionConditionedPipeline.from_config(
-        config=config,
-        dit_path=dit_path,
-        use_text_encoder=False,
-        device="cuda",
-        torch_dtype=torch.bfloat16,
-        load_ema_to_reg=args.load_ema,
-        load_prompt_refiner=True,
-    )
+    if args.use_lora:
+        log.info("LoRA inference mode detected - using LoRA pipeline")
+        pipe = setup_lora_pipeline(config=config, dit_path=dit_path, args=args)
+    else:
+        pipe = Video2WorldActionConditionedPipeline.from_config(
+            config=config,
+            dit_path=dit_path,
+            use_text_encoder=False,
+            device="cuda",
+            torch_dtype=torch.bfloat16,
+            load_ema_to_reg=args.load_ema,
+            load_prompt_refiner=True,
+        )
 
     return pipe, dit_path
 

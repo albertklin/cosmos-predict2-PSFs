@@ -32,7 +32,10 @@ from omegaconf import OmegaConf
 from cosmos_predict2.configs.action_conditioned.config import get_cosmos_predict2_action_conditioned_pipeline
 from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
 from imaginaire.constants import (
+    CosmosPredict2ActionConditionedFPS,
     CosmosPredict2ActionConditionedModelSize,
+    CosmosPredict2ActionConditionedResolution,
+    CosmosPredict2Video2WorldAspectRatio,
     get_cosmos_predict2_action_conditioned_checkpoint,
 )
 from imaginaire.lazy_config.lazy import LazyConfig
@@ -232,6 +235,26 @@ def parse_args() -> argparse.Namespace:
         help="Size of the model to use for video-to-world generation",
     )
     parser.add_argument(
+        "--resolution",
+        choices=CosmosPredict2ActionConditionedResolution.__args__,
+        default="480",
+        help="Resolution of the base model checkpoint to use",
+    )
+    parser.add_argument(
+        "--fps",
+        type=int,
+        choices=CosmosPredict2ActionConditionedFPS.__args__,
+        default=CosmosPredict2ActionConditionedFPS.__args__[0],
+        help="Frame rate of the base model checkpoint to use",
+    )
+    parser.add_argument(
+        "--aspect_ratio",
+        choices=CosmosPredict2Video2WorldAspectRatio.__args__,
+        default="16:9",
+        type=str,
+        help="Aspect ratio of the generated output (width:height)",
+    )
+    parser.add_argument(
         "--dit_path",
         type=str,
         default="",
@@ -271,6 +294,11 @@ def parse_args() -> argparse.Namespace:
         "--load_ema",
         action="store_true",
         help="Use EMA weights for generation.",
+    )
+    parser.add_argument(
+        "--use_cuda_graphs",
+        action="store_true",
+        help="Use CUDA Graphs for the action-conditioned inference",
     )
     parser.add_argument(
         "--input_videos",
@@ -358,14 +386,15 @@ def parse_args() -> argparse.Namespace:
 
 
 def setup_pipeline(args: argparse.Namespace):
-    resolution = "480"
-    fps = 4
-    config = get_cosmos_predict2_action_conditioned_pipeline(model_size=args.model_size, resolution=resolution, fps=fps)
+    config = get_cosmos_predict2_action_conditioned_pipeline(
+        model_size=args.model_size, resolution=args.resolution, fps=args.fps
+    )
+    config.resolution = args.resolution
     if hasattr(args, "dit_path") and args.dit_path:
         dit_path = args.dit_path
     else:
         dit_path = get_cosmos_predict2_action_conditioned_checkpoint(
-            model_size=args.model_size, resolution=resolution, fps=fps
+            model_size=args.model_size, resolution=args.resolution, fps=args.fps
         )
 
     misc.set_random_seed(seed=args.pipeline_seed, by_rank=True)
@@ -503,6 +532,12 @@ def process_single_generation(
     use_teacher_forcing,
     teacher_forcing_interval,
     expected_action_dim,
+    *,
+    batch_size: int,
+    num_conditional_frames: int,
+    aspect_ratio: str,
+    use_cuda_graphs: bool,
+    output_fps: int,
 ):
     actions = get_action_sequence(input_annotation)
 
@@ -515,8 +550,8 @@ def process_single_generation(
     else:
         first_frame = read_first_frame(input_path)
 
-    first_frame = np.broadcast_to(first_frame, (args.batch_size, *first_frame.shape))
-    actions = np.broadcast_to(actions, (args.batch_size, *actions.shape))
+    first_frame = np.broadcast_to(first_frame, (batch_size, *first_frame.shape))
+    actions = np.broadcast_to(actions, (batch_size, *actions.shape))
 
     per_action_dim = actions.shape[-1]
     if expected_action_dim % per_action_dim != 0:
@@ -596,11 +631,14 @@ def process_single_generation(
             chunk_video = pipe(
                 chunk_first_frame,
                 chunk_actions,
-                num_conditional_frames=1,
+                num_conditional_frames=num_conditional_frames,
                 guidance=guidance,
                 seed=seed + start,
                 prompt="",
                 negative_prompt=negative_prompt,
+                fps=output_fps,
+                aspect_ratio=aspect_ratio,
+                use_cuda_graphs=use_cuda_graphs,
             ) # B x C x T x H x W
             print(f"Inference time: {time.time() - start_time:.2f} s")
             video_chunks.append(chunk_video)
@@ -637,11 +675,14 @@ def process_single_generation(
             video = pipe(
                 first_frame,
                 actions[:, i : i + chunk_size],
-                num_conditional_frames=1,
+                num_conditional_frames=num_conditional_frames,
                 guidance=guidance,
                 seed=seed+i,
                 prompt="",
                 negative_prompt=negative_prompt,
+                fps=output_fps,
+                aspect_ratio=aspect_ratio,
+                use_cuda_graphs=use_cuda_graphs,
             ) # B x C x T x H x W
             print(f"Inference time: {time.time() - start_time:.2f} s")
             first_frame = tensor_last_frame_to_numpy(video)
@@ -652,11 +693,14 @@ def process_single_generation(
         video = pipe(
             first_frame,
             actions[:, :chunk_size],
-            num_conditional_frames=1,
+            num_conditional_frames=num_conditional_frames,
             guidance=guidance,
             seed=seed,
             prompt="",
             negative_prompt=negative_prompt,
+            fps=output_fps,
+            aspect_ratio=aspect_ratio,
+            use_cuda_graphs=use_cuda_graphs,
         )
         print(f"Inference time: {time.time() - start_time:.2f} s")
 
@@ -666,11 +710,11 @@ def process_single_generation(
             os.makedirs(out_dir, exist_ok=True)
         log.info(f"Saving generated videos to: {output_path}")
         if len(video) == 1:
-            save_image_or_video(video[0], output_path, fps=4)
+            save_image_or_video(video[0], output_path, fps=output_fps)
         else:
             base = Path(output_path).with_suffix("")
             for i, v in enumerate(video):
-                save_image_or_video(v, f"{base}_{i}.mp4", fps=4)
+                save_image_or_video(v, f"{base}_{i}.mp4", fps=output_fps)
         log.success(f"Successfully saved videos to: {output_path}")
         output_prompt_path = os.path.splitext(output_path)[0] + ".txt"
         prompts_to_save = {"negative_prompt": negative_prompt, "prompt": ""}
@@ -708,6 +752,11 @@ def generate_video(
         use_teacher_forcing=args.use_teacher_forcing,
         teacher_forcing_interval=args.teacher_forcing_interval,
         expected_action_dim=expected_action_dim,
+        batch_size=args.batch_size,
+        num_conditional_frames=args.num_conditional_frames,
+        aspect_ratio=args.aspect_ratio,
+        use_cuda_graphs=args.use_cuda_graphs,
+        output_fps=args.fps,
     )
     return
 

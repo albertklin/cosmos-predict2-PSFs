@@ -26,6 +26,7 @@ from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
 from cosmos_predict2.utils.context_parallel import cat_outputs_cp, split_inputs_cp
+from cosmos_predict2.datasets.utils import VIDEO_RES_SIZE_INFO
 from imaginaire.auxiliary.text_encoder import CosmosTextEncoderConfig, get_cosmos_text_encoder
 from imaginaire.lazy_config import instantiate
 from imaginaire.utils import log, misc
@@ -173,6 +174,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         prompt: str,
         negative_prompt: str = "",
         num_latent_conditional_frames: int = 1,
+        fps: int | None = None,
     ):
         """
         Prepares the input data batch for the diffusion model.
@@ -186,6 +188,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             prompt (str): The text prompt for conditioning.
             negative_prompt (str): Negative prompt.
             num_latent_conditional_frames (int, optional): The number of latent conditional frames. Defaults to 1.
+            fps (int | None, optional): Override for the frames-per-second metadata supplied to the conditioner.
 
         Returns:
             dict: A dictionary containing the prepared data batch, moved to the correct device and dtype.
@@ -203,7 +206,11 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
                 CosmosTextEncoderConfig.EMBED_DIM,
                 dtype=torch.bfloat16,
             ).cuda(),
-            "fps": torch.randint(16, 32, (self.batch_size,)),  # Random FPS (might be used by model)
+            "fps": (
+                torch.full((self.batch_size,), int(fps), dtype=torch.int64)
+                if fps is not None
+                else torch.randint(16, 32, (self.batch_size,))
+            ),
             "padding_mask": torch.zeros(self.batch_size, 1, H, W),  # Padding mask (assumed no padding here)
             "num_conditional_frames": num_latent_conditional_frames,  # Specify number of conditional frames
             "action": actions,
@@ -232,10 +239,13 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         num_sampling_step: int = 35,
         seed: int = 0,
         solver_option: str = "2ab",
+        fps: int | None = None,
+        aspect_ratio: str = "16:9",
+        use_cuda_graphs: bool = False,
     ) -> torch.Tensor | None:
         # Parameter check
-        # width, height = VIDEO_RES_SIZE_INFO[self.config.resolution]["16:9"]  # type: ignore
-        # height, width = self.check_resize_height_width(height, width)
+        width, height = VIDEO_RES_SIZE_INFO[self.config.resolution][aspect_ratio]
+        height, width = self.check_resize_height_width(height, width)
         assert num_conditional_frames in [1, 5], "num_conditional_frames must be 1 or 5"
         num_latent_conditional_frames = self.tokenizer.get_latent_num_frames(num_conditional_frames)
 
@@ -256,6 +266,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             prompt,
             negative_prompt,
             num_latent_conditional_frames=num_latent_conditional_frames,
+            fps=fps,
         )
 
         # preprocess
@@ -272,7 +283,12 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             _W // self.tokenizer.spatial_compression_factor,
         ]
 
-        x0_fn = self.get_x0_fn_from_batch(data_batch, guidance, is_negative_prompt=True)
+        x0_fn = self.get_x0_fn_from_batch(
+            data_batch,
+            guidance,
+            is_negative_prompt=True,
+            use_cuda_graphs=use_cuda_graphs,
+        )
 
         log.info("Starting video generation...")
 

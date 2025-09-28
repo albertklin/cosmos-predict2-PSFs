@@ -32,6 +32,7 @@ from cosmos_predict2.configs.base.config_video2world import (
     get_cosmos_predict2_video2world_pipeline,
 )
 from cosmos_predict2.networks.model_weights_stats import WeightTrainingStat
+from cosmos_predict2.models.utils import load_state_dict
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from cosmos_predict2.utils.checkpointer import non_strict_load_model
 from cosmos_predict2.utils.optim_instantiate import get_base_scheduler
@@ -142,6 +143,7 @@ class Predict2Video2WorldModel(ImaginaireModel):
         )
 
         self.freeze_parameters()
+        lora_reloaded_from_checkpoint = False
         if config.train_architecture == "lora":
             self.add_lora_to_model(
                 self.pipe.dit,
@@ -158,8 +160,13 @@ class Predict2Video2WorldModel(ImaginaireModel):
                     lora_target_modules=config.lora_target_modules,
                     init_lora_weights=config.init_lora_weights,
                 )
+            lora_reloaded_from_checkpoint = self._maybe_reload_lora_from_checkpoint()
             # Enhanced LoRA logging
             self._log_lora_statistics()
+            log.info(
+                "LoRA weights restored from checkpoint: %s",
+                lora_reloaded_from_checkpoint,
+            )
         else:
             self.pipe.denoising_model().requires_grad_(True)
         total_params = sum(p.numel() for p in self.parameters())
@@ -350,6 +357,54 @@ class Predict2Video2WorldModel(ImaginaireModel):
             log.info(f"  Total LoRA: {total_lora_params:,} parameters")
         else:
             log.warning("No LoRA parameters found in model")
+
+    def _maybe_reload_lora_from_checkpoint(self) -> bool:
+        dit_path = getattr(self.config.model_manager_config, "dit_path", "")
+        if not dit_path:
+            log.info("No DiT checkpoint path provided; skipping LoRA reload.")
+            return False
+
+        state_dict = load_state_dict(dit_path)
+        lora_keys = [key for key in state_dict if "lora_" in key]
+        if not lora_keys:
+            log.info("Checkpoint does not contain LoRA parameters; skipping LoRA reload.")
+            return False
+
+        def load_into_module(module: torch.nn.Module | None, prefix: str) -> bool:
+            if module is None:
+                return False
+            filtered_state: dict[str, Any] = {}
+            for key, value in state_dict.items():
+                if "lora_" not in key:
+                    continue
+                if key.startswith(prefix):
+                    filtered_state[key[len(prefix) :]] = value
+                elif key.startswith(prefix + "module."):
+                    filtered_state[key[len(prefix) + len("module.") :]] = value
+            if not filtered_state:
+                return False
+            missing, unexpected = module.load_state_dict(filtered_state, strict=False, assign=True)
+            if missing:
+                log.debug(f"Missing keys when loading LoRA params ({prefix}): {missing}")
+            if unexpected:
+                log.debug(f"Unexpected keys when loading LoRA params ({prefix}): {unexpected}")
+            return True
+
+        loaded_regular = load_into_module(self.pipe.dit, "net.")
+        loaded_ema = load_into_module(self.pipe.dit_ema, "net_ema.")
+
+        del state_dict
+
+        if loaded_regular or loaded_ema:
+            log.success(
+                f"Restored LoRA parameters from checkpoint (regular={loaded_regular}, ema={loaded_ema})"
+            )
+            return True
+
+        log.warning(
+            "LoRA parameters were present in checkpoint but did not match any modules; they may use an unsupported prefix."
+        )
+        return False
 
     def setup_data_key(self) -> None:
         self.input_video_key = self.config.input_video_key  # by default it is video key for Video diffusion model

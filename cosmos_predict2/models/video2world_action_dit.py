@@ -33,6 +33,12 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
+    def reset_parameters(self) -> None:
+        self.fc1.reset_parameters()
+        self.fc2.reset_parameters()
+        if hasattr(self.activation, "reset_parameters"):
+            self.activation.reset_parameters()
+
     def forward(self, x):
         x = self.fc1(x)
         x = self.activation(x)

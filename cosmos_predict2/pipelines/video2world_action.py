@@ -21,7 +21,7 @@ from megatron.core import parallel_state
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
-from cosmos_predict2.models.utils import load_state_dict
+from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
 from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
@@ -36,6 +36,37 @@ IS_PREPROCESSED_KEY = "is_preprocessed"
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", "webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
 NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
+
+
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device | str = "cpu") -> None:
+    """Materialize meta tensors in ``module`` on the given ``device``.
+
+    When modules are instantiated under the ``meta`` device (via
+    :func:`init_weights_on_device`), any parameter/buffer that does not get
+    populated from a checkpoint will remain on the meta device. Accessing them
+    later (e.g., moving the module to a real device) would fail because they do
+    not own any storage.  This helper walks the module tree, replacing those
+    tensors with empty tensors allocated on ``device`` so that they can be
+    initialized explicitly.
+    """
+
+    for name, param in module._parameters.items():
+        if param is None or not isinstance(param, torch.nn.Parameter):
+            continue
+        if getattr(param, "is_meta", False):
+            module._parameters[name] = torch.nn.Parameter(
+                torch.empty(param.shape, device=device, dtype=param.dtype),
+                param.requires_grad,
+            )
+
+    for name, buffer in module._buffers.items():
+        if buffer is None or not isinstance(buffer, torch.Tensor):
+            continue
+        if getattr(buffer, "is_meta", False):
+            module._buffers[name] = torch.empty(buffer.shape, device=device, dtype=buffer.dtype)
+
+    for child in module.children():
+        _materialize_meta_tensors(child, device=device)
 
 
 class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
@@ -122,10 +153,12 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             log.info(f"Loading DiT from {dit_path}")
         else:
             log.warning("dit_path not provided, initializing DiT with random weights")
-        # with init_weights_on_device():
-        # NOTE: we don't load checkpoint on meta device since we have additional action encoder
         dit_config = config.net
-        pipe.dit = instantiate(dit_config).eval()  # inference
+        if dit_path:
+            with init_weights_on_device():
+                pipe.dit = instantiate(dit_config).eval()  # inference
+        else:
+            pipe.dit = instantiate(dit_config).eval()  # inference
 
         if dit_path:
             state_dict = load_state_dict(dit_path)
@@ -143,9 +176,25 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             del state_dict, state_dict_dit_compatible
             log.success(f"Successfully loaded DiT from {dit_path}")
 
+            action_embedder_B_D_missing = False
+            action_embedder_B_3D_missing = False
+            if hasattr(pipe.dit, "action_embedder_B_D"):
+                action_embedder_B_D_missing = pipe.dit.action_embedder_B_D.fc1.weight.is_meta
+            if hasattr(pipe.dit, "action_embedder_B_3D"):
+                action_embedder_B_3D_missing = pipe.dit.action_embedder_B_3D.fc1.weight.is_meta
+
+            _materialize_meta_tensors(pipe.dit)
+
+            if action_embedder_B_D_missing:
+                pipe.dit.action_embedder_B_D.reset_parameters()
+            if action_embedder_B_3D_missing:
+                pipe.dit.action_embedder_B_3D.reset_parameters()
+
         # 6-2. Handle EMA
         if config.ema.enabled:
-            pipe.dit_ema = instantiate(dit_config).eval()
+            with init_weights_on_device():
+                pipe.dit_ema = instantiate(dit_config).eval()
+            _materialize_meta_tensors(pipe.dit_ema)
             pipe.dit_ema.requires_grad_(False)
 
             pipe.dit_ema_worker = FastEmaModelUpdater()  # default when not using FSDP

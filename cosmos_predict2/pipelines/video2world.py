@@ -51,6 +51,29 @@ from imaginaire.utils import log, misc
 from imaginaire.utils.easy_io import easy_io
 from imaginaire.utils.ema import FastEmaModelUpdater
 
+
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device | str = "cpu") -> None:
+    """Ensure tensors instantiated on the meta device receive real storage.
+
+    Recursively walks ``module`` and replaces every parameter/buffer that still
+    lives on the meta device with an empty tensor on ``device`` preserving the
+    original dtype and shape. This mirrors the helpers used by the
+    action-conditioned pipeline so we can safely construct large DiT variants
+    without running their expensive initializers when we know checkpoint
+    weights will be loaded immediately afterwards.
+    """
+
+    for name, param in module._parameters.items():
+        if param is not None and param.is_meta:
+            module._parameters[name] = torch.empty_like(param, device=device)
+
+    for name, buf in module._buffers.items():
+        if buf is not None and buf.is_meta:
+            module._buffers[name] = torch.empty_like(buf, device=device)
+
+    for child in module.children():
+        _materialize_meta_tensors(child, device=device)
+
 IS_PREPROCESSED_KEY = "is_preprocessed"
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", "webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
@@ -374,7 +397,9 @@ class Video2WorldPipeline(BasePipeline):
 
         # 6-2. Handle EMA
         if config.ema.enabled:
-            pipe.dit_ema = instantiate(dit_config).eval()
+            with init_weights_on_device():
+                pipe.dit_ema = instantiate(dit_config).eval()
+            _materialize_meta_tensors(pipe.dit_ema)
             pipe.dit_ema.requires_grad_(False)
 
             pipe.dit_ema_worker = FastEmaModelUpdater()  # default when not using FSDP

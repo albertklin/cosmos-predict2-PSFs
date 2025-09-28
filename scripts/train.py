@@ -78,7 +78,16 @@ For python-based LazyConfig, use "path.key=value".
         action="store_true",
         help="Do a dry run without training. Useful for debugging the config.",
     )
+    parser.add_argument(
+        "--fake-checkpoint",
+        action="store_true",
+        help="Skip loading checkpoint weights for faster debugging runs.",
+    )
     args = parser.parse_args()
+    if args.fake_checkpoint:
+        os.environ["COSMOS_PREDICT2_FAKE_CHECKPOINT"] = "1"
+        logging.warning("Running with fake checkpoints: weights will not be loaded from disk.")
+
     config_module = get_config_module(args.config)
     config = importlib.import_module(config_module).make_config()
     config = override(config, args.opts)

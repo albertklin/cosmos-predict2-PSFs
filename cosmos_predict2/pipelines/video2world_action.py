@@ -183,7 +183,42 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             if hasattr(pipe.dit, "action_embedder_B_3D"):
                 action_embedder_B_3D_missing = pipe.dit.action_embedder_B_3D.fc1.weight.is_meta
 
-            _materialize_meta_tensors(pipe.dit)
+            # Report any tensors that remain on the meta device after loading the checkpoint.
+            uninitialized_params = [
+                name
+                for name, param in pipe.dit.named_parameters()
+                if getattr(param, "is_meta", False)
+            ]
+            uninitialized_buffers = [
+                name
+                for name, buf in pipe.dit.named_buffers()
+                if getattr(buf, "is_meta", False)
+            ]
+            if uninitialized_params or uninitialized_buffers:
+                log.warning(
+                    f"Action-conditioned DiT tensors left on the meta device after loading {dit_path}; "
+                    f"materializing params={uninitialized_params} buffers={uninitialized_buffers}",
+                )
+                _materialize_meta_tensors(pipe.dit)
+                remaining_meta = [
+                    name
+                    for name, param in pipe.dit.named_parameters()
+                    if getattr(param, "is_meta", False)
+                ]
+                remaining_meta += [
+                    name
+                    for name, buf in pipe.dit.named_buffers()
+                    if getattr(buf, "is_meta", False)
+                ]
+                if remaining_meta:
+                    raise RuntimeError(
+                        f"Failed to materialize action-conditioned DiT tensors after loading {dit_path}: {remaining_meta}"
+                    )
+                log.info(
+                    f"Materialized action-conditioned DiT tensors with empty CPU storage so training can resume from {dit_path}"
+                )
+            else:
+                log.info(f"All action-conditioned DiT tensors were materialized by the checkpoint at {dit_path}")
 
             if action_embedder_B_D_missing:
                 pipe.dit.action_embedder_B_D.reset_parameters()

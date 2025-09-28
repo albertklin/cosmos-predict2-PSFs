@@ -195,16 +195,31 @@ def setup_lora_pipeline(
         # Split state dict for regular and EMA models
         state_dict_dit_regular = dict()
         state_dict_dit_ema = dict()
+        def _normalize_dit_key(key: str, prefix: str) -> str:
+            key = key[len(prefix) :]
+            if key.startswith("module."):
+                return key[len("module.") :]
+            if key.startswith("module_ema."):
+                return key[len("module_ema.") :]
+            return key
+
         for k, v in state_dict.items():
             if k.startswith("net."):
-                state_dict_dit_regular[k[4:]] = v
+                state_dict_dit_regular[_normalize_dit_key(k, "net.")] = v
             elif k.startswith("net_ema."):
-                state_dict_dit_ema[k[4:]] = v
+                state_dict_dit_ema[_normalize_dit_key(k, "net_ema.")] = v
+        log.info(
+            f"Checkpoint tensors split into {len(state_dict_dit_regular)} regular and {len(state_dict_dit_ema)} EMA entries"
+        )
+        if not state_dict_dit_regular:
+            log.warning("No regular DiT weights were found in the checkpoint; base model will remain uninitialized")
         # Load regular model with strict=False to allow LoRA weights
         log.info("Loading regular DiT model weights...")
         missing_keys = pipe.dit.load_state_dict(state_dict_dit_regular, strict=False, assign=True)
         if missing_keys.missing_keys:
             log.warning(f"Missing keys in regular model: {missing_keys.missing_keys}")
+        else:
+            log.info("All regular DiT parameters were loaded from the checkpoint")
         if missing_keys.unexpected_keys:
             log.warning(f"Unexpected keys in regular model: {missing_keys.unexpected_keys}")
         # Load EMA model if enabled
@@ -213,8 +228,12 @@ def setup_lora_pipeline(
             missing_keys_ema = pipe.dit_ema.load_state_dict(state_dict_dit_ema, strict=False, assign=True)
             if missing_keys_ema.missing_keys:
                 log.warning(f"Missing keys in EMA model: {missing_keys_ema.missing_keys}")
+            else:
+                log.info("All EMA DiT parameters were loaded from the checkpoint")
             if missing_keys_ema.unexpected_keys:
                 log.warning(f"Unexpected keys in EMA model: {missing_keys_ema.unexpected_keys}")
+        elif config.ema.enabled:
+            log.warning("EMA is enabled but no EMA weights were found in the checkpoint")
         del state_dict, state_dict_dit_regular, state_dict_dit_ema
         log.success(f"Successfully loaded LoRA checkpoint from {dit_path}")
     else:

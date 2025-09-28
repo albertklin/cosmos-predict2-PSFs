@@ -384,13 +384,19 @@ class Video2WorldPipeline(BasePipeline):
         if dit_path:
             state_dict = load_state_dict(dit_path)
             prefix_to_load = "net_ema." if load_ema_to_reg else "net."
-            # drop net. prefix
-            state_dict_dit_compatible = dict()
-            for k, v in state_dict.items():
-                if k.startswith(prefix_to_load):
-                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
-                else:
-                    state_dict_dit_compatible[k] = v
+            # drop net. prefix and normalize potential FSDP module prefixes
+            def _normalize_dit_key(key: str) -> str:
+                if key.startswith(prefix_to_load):
+                    key = key[len(prefix_to_load) :]
+                    if key.startswith("module."):
+                        key = key[len("module.") :]
+                    elif key.startswith("module_ema."):
+                        key = key[len("module_ema.") :]
+                return key
+
+            state_dict_dit_compatible = {
+                _normalize_dit_key(k): v for k, v in state_dict.items()
+            }
             pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
 
             # Report any tensors that remain on the meta device after loading the checkpoint.

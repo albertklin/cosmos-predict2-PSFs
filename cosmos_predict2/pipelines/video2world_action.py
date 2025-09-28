@@ -165,13 +165,43 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             prefix_to_load = "net_ema." if load_ema_to_reg else "net."
 
             log.info(f"Loading {'[ema]/regular' if load_ema_to_reg else 'ema/[regular]'} weights from {dit_path}")
-            # drop net./net_ema. prefix if it exists, depending on the load_ema_to_reg flag
-            state_dict_dit_compatible = dict()
-            for k, v in state_dict.items():
-                if k.startswith(prefix_to_load):
-                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
-                else:
-                    state_dict_dit_compatible[k] = v
+
+            def _normalize_dit_key(key: str) -> str:
+                if key.startswith(prefix_to_load):
+                    key = key[len(prefix_to_load) :]
+                if key.startswith("module."):
+                    return key[len("module.") :]
+                if key.startswith("module_ema."):
+                    return key[len("module_ema.") :]
+                return key
+
+            state_dict_dit_compatible = {
+                _normalize_dit_key(k): v for k, v in state_dict.items()
+            }
+
+            dit_param_names = {name for name, _ in pipe.dit.named_parameters()}
+            dit_buffer_names = {name for name, _ in pipe.dit.named_buffers()}
+            dit_expected_keys = dit_param_names | dit_buffer_names
+            dit_checkpoint_keys = set(state_dict_dit_compatible.keys())
+            dit_matched_keys = dit_expected_keys & dit_checkpoint_keys
+            dit_missing_keys = sorted(dit_expected_keys - dit_matched_keys)
+            dit_unexpected_keys = sorted(dit_checkpoint_keys - dit_expected_keys)
+
+            log.info(
+                f"Normalized action-conditioned DiT checkpoint tensors from {dit_path}: "
+                f"matched {len(dit_matched_keys)}/{len(dit_expected_keys)} expected params/buffers; "
+                f"unexpected={len(dit_unexpected_keys)}"
+            )
+            if dit_unexpected_keys:
+                log.warning(
+                    f"Action-conditioned DiT checkpoint at {dit_path} has unexpected tensors after normalization: "
+                    f"{dit_unexpected_keys[:10]}{'...' if len(dit_unexpected_keys) > 10 else ''}"
+                )
+            if dit_missing_keys:
+                log.warning(
+                    f"Action-conditioned DiT checkpoint at {dit_path} is missing tensors after normalization: "
+                    f"{dit_missing_keys[:10]}{'...' if len(dit_missing_keys) > 10 else ''}"
+                )
             pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
             del state_dict, state_dict_dit_compatible
             log.success(f"Successfully loaded DiT from {dit_path}")

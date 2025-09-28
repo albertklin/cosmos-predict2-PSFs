@@ -170,11 +170,11 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
             }
         )
 
+        action_param_count = sum(param.numel() for param in action_parameters)
         log.info(
-            "Assigned dedicated optimizer group for action heads: lr=%.2e (multiplier %.2fx base) | params=%d",
-            action_head_lr,
-            multiplier,
-            sum(param.numel() for param in action_parameters),
+            f"Assigned dedicated optimizer group for action heads: "
+            f"lr={action_head_lr:.2e} (multiplier {multiplier:.2f}x base) "
+            f"| params={action_param_count}"
         )
 
     def _maybe_reload_lora_from_checkpoint(self) -> bool:
@@ -204,9 +204,9 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
                 return False
             missing, unexpected = module.load_state_dict(filtered_state, strict=False, assign=True)
             if missing:
-                log.debug("Missing keys when loading LoRA params (%s): %s", prefix, missing)
+                log.debug(f"Missing keys when loading LoRA params ({prefix}): {missing}")
             if unexpected:
-                log.debug("Unexpected keys when loading LoRA params (%s): %s", prefix, unexpected)
+                log.debug(f"Unexpected keys when loading LoRA params ({prefix}): {unexpected}")
             return True
 
         loaded_regular = load_into_module(self.pipe.dit, "net.")
@@ -216,9 +216,7 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
 
         if loaded_regular or loaded_ema:
             log.success(
-                "Restored LoRA parameters from checkpoint (regular=%s, ema=%s)",
-                loaded_regular,
-                loaded_ema,
+                f"Restored LoRA parameters from checkpoint (regular={loaded_regular}, ema={loaded_ema})"
             )
             return True
 
@@ -235,22 +233,21 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
         }
 
         log.info("=== Action-Conditioned Training Configuration ===")
-        log.info("  Training architecture: %s", self.config.train_architecture)
+        log.info(f"  Training architecture: {self.config.train_architecture}")
         log.info(
-            "  Action head LR multiplier: %.2f",
-            getattr(self.config, "action_embedder_lr_multiplier", 1.0),
+            f"  Action head LR multiplier: {getattr(self.config, 'action_embedder_lr_multiplier', 1.0):.2f}"
         )
         for name, is_trainable in action_trainable.items():
-            log.info("  %s trainable: %s", name, is_trainable)
+            log.info(f"  {name} trainable: {is_trainable}")
 
         if self.config.train_architecture == "lora":
             log.info(
-                "  LoRA settings -> rank: %d | alpha: %d | targets: %s",
-                self.config.lora_rank,
-                self.config.lora_alpha,
-                self.config.lora_target_modules,
+                f"  LoRA settings -> rank: {self.config.lora_rank} | alpha: {self.config.lora_alpha} "
+                f"| targets: {self.config.lora_target_modules}"
             )
-            log.info("  LoRA weights restored from checkpoint: %s", lora_reloaded_from_checkpoint)
+            log.info(
+                f"  LoRA weights restored from checkpoint: {lora_reloaded_from_checkpoint}"
+            )
 
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        log.info("  Total trainable parameters in model: %d", trainable_params)
+        log.info(f"  Total trainable parameters in model: {trainable_params}")

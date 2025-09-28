@@ -49,8 +49,8 @@ dataloader_video_train = L(DataLoader)(
     pin_memory=True,
 )
 
-# torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train --config=cosmos_predict2/configs/base/config.py -- experiment=finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train
-finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train = dict(
+# torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train --config=cosmos_predict2/configs/base/config.py -- experiment=finetune_cosmos_cv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train
+finetune_cosmos_cv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train = dict(
     defaults=[
         {"override /model": "predict2_video2world_fsdp_14b"},
         {"override /optimizer": "fusedadamw"},
@@ -99,7 +99,7 @@ finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train = 
 
 for _item in [
     # 14b, compview_contact_rich_16fps_text_conditioned_train
-    finetune_cosmos_mv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train,
+    finetune_cosmos_cv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train,
 ]:
     # Get the experiment name from the global variable, e.g. exp01_wan_lora -> experiment_name = "exp01_wan_lora"
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]  # noqa: RUF015

@@ -56,9 +56,6 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
     model=dict(
         config=dict(
             fsdp_shard_size=8,
-            model_manager_config=dict(
-                dit_path="./checkpoints/finetune_cosmos_mv_v2w_14b_multiview_contact_rich_16fps_text_conditioned_train.pt",
-            ),
             pipe_config=dict(
                 state_t=16, # corresponds to num_frames=61; (16-1)*4 + 1 = 61
                 resize_online=False,

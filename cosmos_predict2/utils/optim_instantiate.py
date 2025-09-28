@@ -75,9 +75,10 @@ def get_base_scheduler(
     net_scheduler = hydra.utils.instantiate(scheduler_config)
     net_scheduler.model = model
 
+    num_param_groups = len(optimizer.param_groups)
+    lr_lambda = [net_scheduler.schedule for _ in range(num_param_groups)]
+
     return torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lr_lambda=[
-            net_scheduler.schedule,
-        ],
+        lr_lambda=lr_lambda,
     )

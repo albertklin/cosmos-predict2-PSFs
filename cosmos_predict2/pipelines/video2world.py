@@ -106,6 +106,16 @@ def _format_parameter_names(names: Iterable[str], limit: int = 5) -> str:
     return ", ".join(names[:limit]) + f", ... (+{len(names) - limit} more)"
 
 
+def _state_dict_contains_lora_weights(state_dict: Mapping[str, Any]) -> bool:
+    """Check whether a DiT state_dict contains LoRA-specific parameters."""
+
+    for key in state_dict.keys():
+        lowered = key.lower()
+        if "lora" in lowered:
+            return True
+    return False
+
+
 def _log_state_dict_loading_summary(
     label: str, keys: Iterable[str], results: _IncompatibleKeys
 ) -> None:
@@ -436,17 +446,29 @@ class Video2WorldPipeline(BasePipeline):
         else:
             pipe.dit_ema = None
 
-        if lora_injection_fn is not None:
-            log.info("Injecting LoRA adapters into DiT prior to loading checkpoint weights.")
-            lora_injection_fn(pipe.dit)
-            if pipe.dit_ema is not None:
-                lora_injection_fn(pipe.dit_ema)
-                pipe.dit_ema.requires_grad_(False)
+        state_dict: Mapping[str, Any] | None = None
+        reg_state_dict: dict[str, Any] = {}
+        ema_state_dict: dict[str, Any] = {}
+        checkpoint_has_lora = False
+        load_before_injection = True
+        reg_result: _IncompatibleKeys | None = None
+        ema_result: _IncompatibleKeys | None = None
 
         if dit_path:
             state_dict = load_state_dict(dit_path)
             reg_state_dict, ema_state_dict = _prepare_dit_state_dicts(state_dict, load_ema_to_reg)
+            checkpoint_has_lora = _state_dict_contains_lora_weights(reg_state_dict) or _state_dict_contains_lora_weights(
+                ema_state_dict
+            )
+            load_before_injection = (not checkpoint_has_lora) or (lora_injection_fn is None)
 
+            if checkpoint_has_lora and lora_injection_fn is None:
+                log.warning(
+                    "LoRA weights detected in checkpoint but no LoRA injection function provided; proceeding without applying"
+                    " adapters."
+                )
+
+        if dit_path and load_before_injection:
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
 
@@ -458,7 +480,35 @@ class Video2WorldPipeline(BasePipeline):
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
                 )
 
+        if lora_injection_fn is not None:
+            if checkpoint_has_lora and dit_path and not load_before_injection:
+                log.info("Injecting LoRA adapters into DiT prior to loading LoRA checkpoint weights.")
+            elif dit_path and load_before_injection:
+                log.info("Injecting LoRA adapters into DiT after loading base checkpoint weights.")
+            else:
+                log.info("Injecting LoRA adapters into DiT prior to training.")
+
+            lora_injection_fn(pipe.dit)
+            if pipe.dit_ema is not None:
+                lora_injection_fn(pipe.dit_ema)
+                pipe.dit_ema.requires_grad_(False)
+
+        if dit_path and not load_before_injection:
+            reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
+            _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
+
+            if pipe.dit_ema is not None and ema_state_dict:
+                ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
+                _log_state_dict_loading_summary("DiT EMA", ema_state_dict.keys(), ema_result)
+            elif pipe.dit_ema is not None:
+                log.warning(
+                    "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
+                )
+
+        if state_dict is not None:
             del state_dict, reg_state_dict, ema_state_dict
+
+        if dit_path and reg_result is not None:
             log.success(f"Successfully loaded DiT from {dit_path}")
 
         # 6-2. Handle EMA
@@ -469,7 +519,7 @@ class Video2WorldPipeline(BasePipeline):
             pipe.ema_exp_coefficient = np.roots([1, 7, 16 - s**-2, 12 - s**-2]).real.max()
             # copying is only necessary when starting the training at iteration 0.
             # Actual state_dict should be loaded after the pipe is created.
-            if dit_path and "ema_result" in locals():
+            if dit_path and ema_result is not None:
                 log.info("EMA weights loaded from checkpoint; skipping initial copy from DiT.")
             else:
                 pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)

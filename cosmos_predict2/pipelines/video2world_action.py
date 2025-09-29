@@ -132,10 +132,12 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         dit_config = config.net
         with init_weights_on_device():
             pipe.dit = instantiate(dit_config).eval()  # inference
+            pipe.dit = pipe.dit.to_empty(device="cpu")
 
         if config.ema.enabled:
             with init_weights_on_device():
                 pipe.dit_ema = instantiate(dit_config).eval()
+            pipe.dit_ema = pipe.dit_ema.to_empty(device="cpu")
             pipe.dit_ema.requires_grad_(False)
         else:
             pipe.dit_ema = None

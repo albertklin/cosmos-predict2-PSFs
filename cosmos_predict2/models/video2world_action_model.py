@@ -15,6 +15,7 @@
 
 import math
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 from megatron.core import parallel_state

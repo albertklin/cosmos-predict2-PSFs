@@ -27,6 +27,7 @@ from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import (
     Video2WorldPipeline,
     _log_state_dict_loading_summary,
+    _log_uninitialized_tensors,
     _prepare_dit_state_dicts,
     _state_dict_contains_lora_weights,
 )
@@ -179,6 +180,10 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
                     "EMA model is enabled for action-conditioned pipeline but no EMA weights were present; copying from current DiT."
                 )
 
+            _log_uninitialized_tensors(pipe.dit, "Action DiT")
+            if pipe.dit_ema is not None:
+                _log_uninitialized_tensors(pipe.dit_ema, "Action DiT EMA")
+
         if lora_injection_fn is not None:
             if checkpoint_has_lora and dit_path and not load_before_injection:
                 log.info(
@@ -208,6 +213,10 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
                 log.warning(
                     "EMA model is enabled for action-conditioned pipeline but no EMA weights were present; copying from current DiT."
                 )
+
+            _log_uninitialized_tensors(pipe.dit, "Action DiT")
+            if pipe.dit_ema is not None:
+                _log_uninitialized_tensors(pipe.dit_ema, "Action DiT EMA")
 
         if state_dict is not None:
             del state_dict, reg_state_dict, ema_state_dict

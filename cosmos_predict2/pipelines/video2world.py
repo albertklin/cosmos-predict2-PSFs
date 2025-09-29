@@ -106,6 +106,51 @@ def _format_parameter_names(names: Iterable[str], limit: int = 5) -> str:
     return ", ".join(names[:limit]) + f", ... (+{len(names) - limit} more)"
 
 
+def _is_tensor_uninitialized(tensor: torch.Tensor) -> bool:
+    """Return ``True`` if the tensor still matches the ``to_empty`` placeholder."""
+
+    if tensor is None:
+        return False
+    if getattr(tensor, "is_meta", False):
+        return True
+
+    try:
+        return tensor.numel() == 0
+    except RuntimeError:
+        # Some tensors (e.g., sharded parameters) may not expose ``numel`` yet when
+        # still materialized as meta tensors. Treat them as uninitialized so the
+        # caller can take corrective action.
+        return True
+
+
+def _collect_uninitialized_tensor_names(module: torch.nn.Module) -> list[str]:
+    """Collect parameter and buffer names that still carry empty storage."""
+
+    names: list[str] = []
+    for name, tensor in module.named_parameters(recurse=True):
+        if _is_tensor_uninitialized(tensor):
+            names.append(name)
+    for name, tensor in module.named_buffers(recurse=True):
+        if _is_tensor_uninitialized(tensor):
+            names.append(name)
+    return names
+
+
+def _log_uninitialized_tensors(module: torch.nn.Module | None, label: str) -> None:
+    """Log tensors that remain uninitialized after checkpoint loading."""
+
+    if module is None:
+        return
+
+    names = _collect_uninitialized_tensor_names(module)
+    if names:
+        log.warning(
+            f"[{label}] {len(names)} tensors remain uninitialized after loading: {_format_parameter_names(names)}"
+        )
+    else:
+        log.info(f"[{label}] All tensors initialized from checkpoint.")
+
+
 def _state_dict_contains_lora_weights(state_dict: Mapping[str, Any]) -> bool:
     """Check whether a DiT state_dict contains LoRA-specific parameters."""
 
@@ -482,6 +527,10 @@ class Video2WorldPipeline(BasePipeline):
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
                 )
 
+            _log_uninitialized_tensors(pipe.dit, "DiT")
+            if pipe.dit_ema is not None:
+                _log_uninitialized_tensors(pipe.dit_ema, "DiT EMA")
+
         if lora_injection_fn is not None:
             if checkpoint_has_lora and dit_path and not load_before_injection:
                 log.info("Injecting LoRA adapters into DiT prior to loading LoRA checkpoint weights.")
@@ -506,6 +555,10 @@ class Video2WorldPipeline(BasePipeline):
                 log.warning(
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
                 )
+
+            _log_uninitialized_tensors(pipe.dit, "DiT")
+            if pipe.dit_ema is not None:
+                _log_uninitialized_tensors(pipe.dit_ema, "DiT EMA")
 
         if state_dict is not None:
             del state_dict, reg_state_dict, ema_state_dict

@@ -31,7 +31,11 @@ from cosmos_predict2.configs.base.config_video2world import (
     get_cosmos_predict2_video2world_pipeline,
 )
 from cosmos_predict2.networks.model_weights_stats import WeightTrainingStat
-from cosmos_predict2.pipelines.video2world import Video2WorldPipeline, _prepare_dit_state_dicts
+from cosmos_predict2.pipelines.video2world import (
+    Video2WorldPipeline,
+    _log_uninitialized_tensors,
+    _prepare_dit_state_dicts,
+)
 from cosmos_predict2.utils.optim_instantiate import get_base_scheduler
 from cosmos_predict2.utils.torch_future import clip_grad_norm_
 from imaginaire.constants import get_cosmos_predict2_video2world_checkpoint
@@ -153,6 +157,13 @@ class Predict2Video2WorldModel(ImaginaireModel):
             lora_injection_fn=lora_injection_fn,
         )
 
+        def _log_weight_status(stage: str) -> None:
+            _log_uninitialized_tensors(self.pipe.dit, f"{stage} DiT")
+            if self.pipe.dit_ema is not None:
+                _log_uninitialized_tensors(self.pipe.dit_ema, f"{stage} DiT EMA")
+
+        _log_weight_status("Video2WorldModel (post-pipeline-init)")
+
         self.freeze_parameters()
         if config.train_architecture == "lora":
             self._prepare_lora_trainable_parameters()
@@ -179,8 +190,10 @@ class Predict2Video2WorldModel(ImaginaireModel):
             )
             log.info(f"Using FSDP with shard size {fsdp_shard_size} | device mesh: {dp_mesh}")
             self.pipe.apply_fsdp(dp_mesh)
+            _log_weight_status("Video2WorldModel (post-FSDP)")
         else:
             log.info("FSDP (Fully Sharded Data Parallel) is disabled.")
+            _log_weight_status("Video2WorldModel (final)")
 
     # New function, added for i4 adaption
     @property

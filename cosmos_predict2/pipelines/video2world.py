@@ -16,7 +16,7 @@
 import gc
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from typing import Any
 
@@ -292,6 +292,40 @@ class Video2WorldPipeline(BasePipeline):
         self.use_unified_sequence_parallel = False
 
     @staticmethod
+    @staticmethod
+    def _split_checkpoint_state_dict(
+        state_dict: Mapping[str, torch.Tensor], load_ema_to_reg: bool
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """Split a checkpoint ``state_dict`` into regular and EMA components."""
+
+        regular_prefix = "net_ema." if load_ema_to_reg else "net."
+        ema_prefix = "net." if load_ema_to_reg else "net_ema."
+
+        def _maybe_add_entry(
+            prefix: str, target: dict[str, torch.Tensor], key: str, value: torch.Tensor
+        ) -> bool:
+            if not key.startswith(prefix):
+                return False
+
+            normalized_key = key[len(prefix) :]
+            if normalized_key.startswith("module."):
+                normalized_key = normalized_key[len("module.") :]
+            elif normalized_key.startswith("module_ema."):
+                normalized_key = normalized_key[len("module_ema.") :]
+
+            target[normalized_key] = value
+            return True
+
+        regular_state: dict[str, torch.Tensor] = {}
+        ema_state: dict[str, torch.Tensor] = {}
+
+        for key, value in state_dict.items():
+            if _maybe_add_entry(regular_prefix, regular_state, key, value):
+                continue
+            _maybe_add_entry(ema_prefix, ema_state, key, value)
+
+        return regular_state, ema_state
+
     def from_config(
         config: Video2WorldPipelineConfig,
         dit_path: str = "",
@@ -302,6 +336,7 @@ class Video2WorldPipeline(BasePipeline):
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
         load_prompt_refiner: bool = False,
+        load_weights: bool = True,
     ) -> Any:
         # Create a pipe
         pipe = Video2WorldPipeline(device=device, torch_dtype=torch_dtype)
@@ -374,70 +409,15 @@ class Video2WorldPipeline(BasePipeline):
 
         # 6. Set up DiT
         if dit_path:
-            log.info(f"Loading DiT from {dit_path}")
+            log.info(f"Preparing to load DiT from {dit_path}")
         else:
             log.warning("dit_path not provided, initializing DiT with random weights")
         with init_weights_on_device():
             dit_config = config.net
             pipe.dit = instantiate(dit_config).eval()  # inference
 
-        if dit_path:
-            state_dict = load_state_dict(dit_path)
-            prefix_to_load = "net_ema." if load_ema_to_reg else "net."
-            # drop net. prefix and normalize potential FSDP module prefixes
-            def _normalize_dit_key(key: str) -> str:
-                if key.startswith(prefix_to_load):
-                    key = key[len(prefix_to_load) :]
-                    if key.startswith("module."):
-                        key = key[len("module.") :]
-                    elif key.startswith("module_ema."):
-                        key = key[len("module_ema.") :]
-                return key
-
-            state_dict_dit_compatible = {
-                _normalize_dit_key(k): v for k, v in state_dict.items()
-            }
-            pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
-
-            # Report any tensors that remain on the meta device after loading the checkpoint.
-            uninitialized_params = [
-                name
-                for name, param in pipe.dit.named_parameters()
-                if getattr(param, "is_meta", False)
-            ]
-            uninitialized_buffers = [
-                name
-                for name, buf in pipe.dit.named_buffers()
-                if getattr(buf, "is_meta", False)
-            ]
-            if uninitialized_params or uninitialized_buffers:
-                log.warning(
-                    f"DiT tensors left on the meta device after loading {dit_path}; "
-                    f"materializing params={uninitialized_params} buffers={uninitialized_buffers}",
-                )
-                _materialize_meta_tensors(pipe.dit)
-                # Verify that all tensors have real storage before EMA initialization.
-                remaining_meta = [
-                    name
-                    for name, param in pipe.dit.named_parameters()
-                    if getattr(param, "is_meta", False)
-                ]
-                remaining_meta += [
-                    name
-                    for name, buf in pipe.dit.named_buffers()
-                    if getattr(buf, "is_meta", False)
-                ]
-                if remaining_meta:
-                    raise RuntimeError(
-                        f"Failed to materialize DiT tensors after loading {dit_path}: {remaining_meta}"
-                    )
-                log.info(
-                    f"Materialized DiT tensors with empty CPU storage so training can resume from {dit_path}"
-                )
-            else:
-                log.info(f"All DiT tensors were materialized by the checkpoint at {dit_path}")
-            del state_dict, state_dict_dit_compatible
-            log.success(f"Successfully loaded DiT from {dit_path}")
+        if load_weights:
+            pipe.load_checkpoint(dit_path, load_ema_to_reg=load_ema_to_reg)
 
         # 6-2. Handle EMA
         if config.ema.enabled:
@@ -464,6 +444,134 @@ class Video2WorldPipeline(BasePipeline):
             pipe.data_parallel_size = 1
 
         return pipe
+
+    def load_checkpoint(self, dit_path: str, load_ema_to_reg: bool = False) -> dict[str, Any]:
+        """Load a DiT checkpoint following the LoRA-first initialization flow."""
+
+        report: dict[str, Any] = {
+            "path": dit_path,
+            "loaded_regular": False,
+            "loaded_ema": False,
+            "contains_lora": False,
+            "missing_regular": [],
+            "unexpected_regular": [],
+            "missing_ema": [],
+            "unexpected_ema": [],
+        }
+
+        if not dit_path:
+            log.warning("No checkpoint path provided; skipping DiT weight loading.")
+            return report
+
+        log.info(
+            "Loading %s weights from %s",
+            "[ema]/regular" if load_ema_to_reg else "regular/[ema]",
+            dit_path,
+        )
+
+        state_dict = load_state_dict(dit_path)
+        state_dict_regular, state_dict_ema = self._split_checkpoint_state_dict(state_dict, load_ema_to_reg)
+
+        report["loaded_regular"] = bool(state_dict_regular)
+        report["loaded_ema"] = bool(state_dict_ema)
+        report["contains_lora"] = any(
+            "lora_" in key for key in (*state_dict_regular.keys(), *state_dict_ema.keys())
+        )
+
+        if state_dict_regular:
+            missing_keys = self.dit.load_state_dict(state_dict_regular, strict=False, assign=True)
+            report["missing_regular"] = list(missing_keys.missing_keys)
+            report["unexpected_regular"] = list(missing_keys.unexpected_keys)
+            if missing_keys.missing_keys:
+                log.warning(f"Missing keys in regular DiT model: {missing_keys.missing_keys}")
+            else:
+                log.info("All regular DiT parameters were loaded from the checkpoint")
+            if missing_keys.unexpected_keys:
+                log.warning(f"Unexpected keys in regular DiT model: {missing_keys.unexpected_keys}")
+        else:
+            log.warning(
+                "No regular DiT weights were found in the checkpoint; base model will remain uninitialized"
+            )
+
+        if self.dit_ema is not None:
+            if state_dict_ema:
+                missing_keys_ema = self.dit_ema.load_state_dict(state_dict_ema, strict=False, assign=True)
+                report["missing_ema"] = list(missing_keys_ema.missing_keys)
+                report["unexpected_ema"] = list(missing_keys_ema.unexpected_keys)
+                if missing_keys_ema.missing_keys:
+                    log.warning(f"Missing keys in EMA DiT model: {missing_keys_ema.missing_keys}")
+                else:
+                    log.info("All EMA DiT parameters were loaded from the checkpoint")
+                if missing_keys_ema.unexpected_keys:
+                    log.warning(f"Unexpected keys in EMA DiT model: {missing_keys_ema.unexpected_keys}")
+            else:
+                log.warning("EMA is enabled but no EMA weights were found in the checkpoint")
+        elif state_dict_ema:
+            log.warning("EMA weights were found in the checkpoint but the pipeline has no EMA module; ignoring them")
+
+        del state_dict, state_dict_regular, state_dict_ema
+
+        uninitialized_params = [
+            name for name, param in self.dit.named_parameters() if getattr(param, "is_meta", False)
+        ]
+        uninitialized_buffers = [
+            name for name, buf in self.dit.named_buffers() if getattr(buf, "is_meta", False)
+        ]
+        if uninitialized_params or uninitialized_buffers:
+            log.warning(
+                f"DiT tensors left on the meta device after loading {dit_path}; "
+                f"materializing params={uninitialized_params} buffers={uninitialized_buffers}"
+            )
+            _materialize_meta_tensors(self.dit)
+            remaining_meta = [
+                name for name, param in self.dit.named_parameters() if getattr(param, "is_meta", False)
+            ]
+            remaining_meta += [
+                name for name, buf in self.dit.named_buffers() if getattr(buf, "is_meta", False)
+            ]
+            if remaining_meta:
+                raise RuntimeError(
+                    f"Failed to materialize DiT tensors after loading {dit_path}: {remaining_meta}"
+                )
+            log.info(
+                f"Materialized DiT tensors with empty CPU storage so training can resume from {dit_path}"
+            )
+        else:
+            log.info(f"All DiT tensors were materialized by the checkpoint at {dit_path}")
+
+        if self.dit_ema is not None:
+            ema_uninitialized_params = [
+                name
+                for name, param in self.dit_ema.named_parameters()
+                if getattr(param, "is_meta", False)
+            ]
+            ema_uninitialized_buffers = [
+                name for name, buf in self.dit_ema.named_buffers() if getattr(buf, "is_meta", False)
+            ]
+            if ema_uninitialized_params or ema_uninitialized_buffers:
+                log.warning(
+                    f"EMA DiT tensors left on the meta device after loading {dit_path}; "
+                    f"materializing params={ema_uninitialized_params} buffers={ema_uninitialized_buffers}"
+                )
+                _materialize_meta_tensors(self.dit_ema)
+                ema_remaining_meta = [
+                    name
+                    for name, param in self.dit_ema.named_parameters()
+                    if getattr(param, "is_meta", False)
+                ]
+                ema_remaining_meta += [
+                    name for name, buf in self.dit_ema.named_buffers() if getattr(buf, "is_meta", False)
+                ]
+                if ema_remaining_meta:
+                    raise RuntimeError(
+                        f"Failed to materialize EMA DiT tensors after loading {dit_path}: {ema_remaining_meta}"
+                    )
+                log.info(
+                    f"Materialized EMA DiT tensors with empty CPU storage so training can resume from {dit_path}"
+                )
+
+        log.success(f"Finished loading DiT checkpoint from {dit_path}")
+        return report
 
     def setup_data_key(self) -> None:
         self.input_video_key = self.config.input_video_key  # by default it is video key for Video diffusion model

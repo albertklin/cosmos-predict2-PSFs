@@ -26,8 +26,8 @@ from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
 from cosmos_predict2.pipelines.video2world import (
     Video2WorldPipeline,
+    _initialize_missing_modules,
     _log_state_dict_loading_summary,
-    _log_uninitialized_tensors,
     _prepare_dit_state_dicts,
     _state_dict_contains_lora_weights,
 )
@@ -171,18 +171,18 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             )
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("Action DiT", reg_state_dict.keys(), reg_result)
+            if isinstance(reg_result, _IncompatibleKeys):
+                _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "Action DiT")
 
             if pipe.dit_ema is not None and ema_state_dict:
                 ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
                 _log_state_dict_loading_summary("Action DiT EMA", ema_state_dict.keys(), ema_result)
+                if isinstance(ema_result, _IncompatibleKeys):
+                    _initialize_missing_modules(pipe.dit_ema, ema_result.missing_keys, "Action DiT EMA")
             elif pipe.dit_ema is not None:
                 log.warning(
                     "EMA model is enabled for action-conditioned pipeline but no EMA weights were present; copying from current DiT."
                 )
-
-            _log_uninitialized_tensors(pipe.dit, "Action DiT")
-            if pipe.dit_ema is not None:
-                _log_uninitialized_tensors(pipe.dit_ema, "Action DiT EMA")
 
         if lora_injection_fn is not None:
             if checkpoint_has_lora and dit_path and not load_before_injection:
@@ -205,18 +205,18 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             )
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("Action DiT", reg_state_dict.keys(), reg_result)
+            if isinstance(reg_result, _IncompatibleKeys):
+                _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "Action DiT")
 
             if pipe.dit_ema is not None and ema_state_dict:
                 ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
                 _log_state_dict_loading_summary("Action DiT EMA", ema_state_dict.keys(), ema_result)
+                if isinstance(ema_result, _IncompatibleKeys):
+                    _initialize_missing_modules(pipe.dit_ema, ema_result.missing_keys, "Action DiT EMA")
             elif pipe.dit_ema is not None:
                 log.warning(
                     "EMA model is enabled for action-conditioned pipeline but no EMA weights were present; copying from current DiT."
                 )
-
-            _log_uninitialized_tensors(pipe.dit, "Action DiT")
-            if pipe.dit_ema is not None:
-                _log_uninitialized_tensors(pipe.dit_ema, "Action DiT EMA")
 
         if state_dict is not None:
             del state_dict, reg_state_dict, ema_state_dict

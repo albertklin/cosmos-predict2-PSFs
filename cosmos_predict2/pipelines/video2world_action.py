@@ -126,14 +126,15 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             pipe.video_guardrail_runner = None
 
         # 6. Set up DiT
+        dit_config = config.net
         if dit_path:
             log.info(f"Loading DiT from {dit_path}")
+            with init_weights_on_device():
+                pipe.dit = instantiate(dit_config).eval()  # inference
+                pipe.dit = pipe.dit.to_empty(device="cpu")
         else:
             log.warning("dit_path not provided, initializing DiT with random weights")
-        dit_config = config.net
-        with init_weights_on_device():
             pipe.dit = instantiate(dit_config).eval()  # inference
-            pipe.dit = pipe.dit.to_empty(device="cpu")
 
         if config.ema.enabled:
             with init_weights_on_device():

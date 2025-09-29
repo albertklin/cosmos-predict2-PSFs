@@ -106,51 +106,6 @@ def _format_parameter_names(names: Iterable[str], limit: int = 5) -> str:
     return ", ".join(names[:limit]) + f", ... (+{len(names) - limit} more)"
 
 
-def _is_tensor_uninitialized(tensor: torch.Tensor) -> bool:
-    """Return ``True`` if the tensor still matches the ``to_empty`` placeholder."""
-
-    if tensor is None:
-        return False
-    if getattr(tensor, "is_meta", False):
-        return True
-
-    try:
-        return tensor.numel() == 0
-    except RuntimeError:
-        # Some tensors (e.g., sharded parameters) may not expose ``numel`` yet when
-        # still materialized as meta tensors. Treat them as uninitialized so the
-        # caller can take corrective action.
-        return True
-
-
-def _collect_uninitialized_tensor_names(module: torch.nn.Module) -> list[str]:
-    """Collect parameter and buffer names that still carry empty storage."""
-
-    names: list[str] = []
-    for name, tensor in module.named_parameters(recurse=True):
-        if _is_tensor_uninitialized(tensor):
-            names.append(name)
-    for name, tensor in module.named_buffers(recurse=True):
-        if _is_tensor_uninitialized(tensor):
-            names.append(name)
-    return names
-
-
-def _log_uninitialized_tensors(module: torch.nn.Module | None, label: str) -> None:
-    """Log tensors that remain uninitialized after checkpoint loading."""
-
-    if module is None:
-        return
-
-    names = _collect_uninitialized_tensor_names(module)
-    if names:
-        log.warning(
-            f"[{label}] {len(names)} tensors remain uninitialized after loading: {_format_parameter_names(names)}"
-        )
-    else:
-        log.info(f"[{label}] All tensors initialized from checkpoint.")
-
-
 def _state_dict_contains_lora_weights(state_dict: Mapping[str, Any]) -> bool:
     """Check whether a DiT state_dict contains LoRA-specific parameters."""
 
@@ -180,6 +135,45 @@ def _log_state_dict_loading_summary(
         log.info(f"[{label}] Newly initialized tensors: {_format_parameter_names(missing)}")
     if unexpected:
         log.warning(f"[{label}] Unexpected tensors ignored: {_format_parameter_names(unexpected)}")
+
+
+def _initialize_missing_modules(
+    module: torch.nn.Module | None, missing_keys: Iterable[str], label: str
+) -> None:
+    if module is None:
+        return
+
+    missing_keys = list(missing_keys)
+    if not missing_keys:
+        return
+
+    module_map = dict(module.named_modules())
+    reset_modules: list[str] = []
+    seen: set[torch.nn.Module] = set()
+
+    for key in missing_keys:
+        if "." in key:
+            prefix = key.rsplit(".", 1)[0]
+        else:
+            prefix = ""
+
+        if prefix == "":
+            continue
+
+        target = module_map.get(prefix)
+        if target is None or not hasattr(target, "reset_parameters"):
+            continue
+        if target in seen:
+            continue
+
+        target.reset_parameters()
+        seen.add(target)
+        reset_modules.append(prefix)
+
+    if reset_modules:
+        log.info(
+            f"[{label}] Reinitialized modules for missing checkpoint entries: {_format_parameter_names(reset_modules)}"
+        )
 
 
 def resize_input(video: torch.Tensor, resolution: list[int]) -> torch.Tensor:
@@ -518,18 +512,18 @@ class Video2WorldPipeline(BasePipeline):
         if dit_path and load_before_injection:
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
+            if isinstance(reg_result, _IncompatibleKeys):
+                _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "DiT")
 
             if pipe.dit_ema is not None and ema_state_dict:
                 ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
                 _log_state_dict_loading_summary("DiT EMA", ema_state_dict.keys(), ema_result)
+                if isinstance(ema_result, _IncompatibleKeys):
+                    _initialize_missing_modules(pipe.dit_ema, ema_result.missing_keys, "DiT EMA")
             elif pipe.dit_ema is not None:
                 log.warning(
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
                 )
-
-            _log_uninitialized_tensors(pipe.dit, "DiT")
-            if pipe.dit_ema is not None:
-                _log_uninitialized_tensors(pipe.dit_ema, "DiT EMA")
 
         if lora_injection_fn is not None:
             if checkpoint_has_lora and dit_path and not load_before_injection:
@@ -547,18 +541,18 @@ class Video2WorldPipeline(BasePipeline):
         if dit_path and not load_before_injection:
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
+            if isinstance(reg_result, _IncompatibleKeys):
+                _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "DiT")
 
             if pipe.dit_ema is not None and ema_state_dict:
                 ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
                 _log_state_dict_loading_summary("DiT EMA", ema_state_dict.keys(), ema_result)
+                if isinstance(ema_result, _IncompatibleKeys):
+                    _initialize_missing_modules(pipe.dit_ema, ema_result.missing_keys, "DiT EMA")
             elif pipe.dit_ema is not None:
                 log.warning(
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
                 )
-
-            _log_uninitialized_tensors(pipe.dit, "DiT")
-            if pipe.dit_ema is not None:
-                _log_uninitialized_tensors(pipe.dit_ema, "DiT EMA")
 
         if state_dict is not None:
             del state_dict, reg_state_dict, ema_state_dict

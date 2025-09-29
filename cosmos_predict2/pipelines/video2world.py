@@ -16,9 +16,9 @@
 import gc
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Iterable
 
 import numpy as np
 import torch
@@ -28,6 +28,7 @@ from megatron.core import parallel_state
 from PIL import Image
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import FSDPModule, fully_shard
+from torch.nn.modules.module import _IncompatibleKeys
 from tqdm import tqdm
 
 from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
@@ -55,6 +56,75 @@ IS_PREPROCESSED_KEY = "is_preprocessed"
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", "webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
 NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
+
+
+def _strip_module_prefix(key: str) -> str:
+    for prefix in ("module.", "module_ema."):
+        if key.startswith(prefix):
+            return key[len(prefix) :]
+    return key
+
+
+def _prepare_dit_state_dicts(
+    state_dict: Mapping[str, Any], load_ema_to_reg: bool
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    regular: dict[str, Any] = {}
+    ema: dict[str, Any] = {}
+    extras: dict[str, Any] = {}
+
+    for key, value in state_dict.items():
+        if key.startswith("net_ema."):
+            ema[_strip_module_prefix(key[len("net_ema.") :])] = value
+        elif key.startswith("net."):
+            regular[_strip_module_prefix(key[len("net.") :])] = value
+        else:
+            extras[_strip_module_prefix(key)] = value
+
+    if load_ema_to_reg:
+        if ema:
+            log.info("Loading EMA weights into regular DiT parameters as requested.")
+            regular_to_load = dict(ema)
+        else:
+            log.warning("EMA weights requested for regular model but none were found; using standard weights instead.")
+            regular_to_load = dict(regular)
+    else:
+        regular_to_load = dict(regular) if regular else dict()
+        if not regular_to_load and ema:
+            log.warning("Regular DiT weights not found; falling back to EMA weights for initialization.")
+            regular_to_load = dict(ema)
+
+    regular_to_load.update(extras)
+    return regular_to_load, ema
+
+
+def _format_parameter_names(names: Iterable[str], limit: int = 5) -> str:
+    names = list(names)
+    if not names:
+        return "none"
+    if len(names) <= limit:
+        return ", ".join(names)
+    return ", ".join(names[:limit]) + f", ... (+{len(names) - limit} more)"
+
+
+def _log_state_dict_loading_summary(
+    label: str, keys: Iterable[str], results: _IncompatibleKeys
+) -> None:
+    if results is None:
+        return
+
+    keys = list(keys)
+    missing = list(results.missing_keys)
+    unexpected = list(results.unexpected_keys)
+    loaded_count = max(len(keys) - len(unexpected), 0)
+
+    log.info(
+        f"[{label}] Loaded {loaded_count} tensors from checkpoint | "
+        f"missing={len(missing)} | unexpected={len(unexpected)}"
+    )
+    if missing:
+        log.info(f"[{label}] Newly initialized tensors: {_format_parameter_names(missing)}")
+    if unexpected:
+        log.warning(f"[{label}] Unexpected tensors ignored: {_format_parameter_names(unexpected)}")
 
 
 def resize_input(video: torch.Tensor, resolution: list[int]) -> torch.Tensor:
@@ -279,6 +349,7 @@ class Video2WorldPipeline(BasePipeline):
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
         load_prompt_refiner: bool = False,
+        lora_injection_fn: Callable[[torch.nn.Module], None] | None = None,
     ) -> Any:
         # Create a pipe
         pipe = Video2WorldPipeline(device=device, torch_dtype=torch_dtype)
@@ -358,33 +429,50 @@ class Video2WorldPipeline(BasePipeline):
             dit_config = config.net
             pipe.dit = instantiate(dit_config).eval()  # inference
 
-        if dit_path:
-            state_dict = load_state_dict(dit_path)
-            prefix_to_load = "net_ema." if load_ema_to_reg else "net."
-            # drop net. prefix
-            state_dict_dit_compatible = dict()
-            for k, v in state_dict.items():
-                if k.startswith(prefix_to_load):
-                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
-                else:
-                    state_dict_dit_compatible[k] = v
-            pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
-            del state_dict, state_dict_dit_compatible
-            log.success(f"Successfully loaded DiT from {dit_path}")
-
-        # 6-2. Handle EMA
         if config.ema.enabled:
             with init_weights_on_device():
                 pipe.dit_ema = instantiate(dit_config).eval()
             pipe.dit_ema.requires_grad_(False)
+        else:
+            pipe.dit_ema = None
 
+        if lora_injection_fn is not None:
+            log.info("Injecting LoRA adapters into DiT prior to loading checkpoint weights.")
+            lora_injection_fn(pipe.dit)
+            if pipe.dit_ema is not None:
+                lora_injection_fn(pipe.dit_ema)
+                pipe.dit_ema.requires_grad_(False)
+
+        if dit_path:
+            state_dict = load_state_dict(dit_path)
+            reg_state_dict, ema_state_dict = _prepare_dit_state_dicts(state_dict, load_ema_to_reg)
+
+            reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
+            _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
+
+            if pipe.dit_ema is not None and ema_state_dict:
+                ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
+                _log_state_dict_loading_summary("DiT EMA", ema_state_dict.keys(), ema_result)
+            elif pipe.dit_ema is not None:
+                log.warning(
+                    "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
+                )
+
+            del state_dict, reg_state_dict, ema_state_dict
+            log.success(f"Successfully loaded DiT from {dit_path}")
+
+        # 6-2. Handle EMA
+        if config.ema.enabled:
             pipe.dit_ema_worker = FastEmaModelUpdater()  # default when not using FSDP
 
             s = config.ema.rate
             pipe.ema_exp_coefficient = np.roots([1, 7, 16 - s**-2, 12 - s**-2]).real.max()
             # copying is only necessary when starting the training at iteration 0.
             # Actual state_dict should be loaded after the pipe is created.
-            pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
+            if dit_path and "ema_result" in locals():
+                log.info("EMA weights loaded from checkpoint; skipping initial copy from DiT.")
+            else:
+                pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
 
         pipe.dit = pipe.dit.to(device=device, dtype=torch_dtype)
         torch.cuda.empty_cache()

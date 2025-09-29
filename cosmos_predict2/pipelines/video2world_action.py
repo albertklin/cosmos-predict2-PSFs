@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -23,7 +23,11 @@ from cosmos_predict2.auxiliary.cosmos_reason1 import CosmosReason1
 from cosmos_predict2.configs.base.config_video2world import Video2WorldPipelineConfig
 from cosmos_predict2.models.utils import init_weights_on_device, load_state_dict
 from cosmos_predict2.module.denoiser_scaling import RectifiedFlowScaling
-from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
+from cosmos_predict2.pipelines.video2world import (
+    Video2WorldPipeline,
+    _log_state_dict_loading_summary,
+    _prepare_dit_state_dicts,
+)
 from cosmos_predict2.schedulers.rectified_flow_scheduler import RectifiedFlowAB2Scheduler
 from cosmos_predict2.utils.context_parallel import cat_outputs_cp, split_inputs_cp
 from cosmos_predict2.datasets.utils import VIDEO_RES_SIZE_INFO
@@ -51,6 +55,7 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         torch_dtype: torch.dtype = torch.bfloat16,
         load_ema_to_reg: bool = False,
         load_prompt_refiner: bool = False,
+        lora_injection_fn: Callable[[torch.nn.Module], None] | None = None,
     ) -> Any:
         # Create a pipe
         pipe = Video2WorldActionConditionedPipeline(device=device, torch_dtype=torch_dtype)
@@ -123,41 +128,56 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         else:
             log.warning("dit_path not provided, initializing DiT with random weights")
         dit_config = config.net
-        if dit_path:
-            with init_weights_on_device():
-                pipe.dit = instantiate(dit_config).eval()  # inference
-        else:
+        with init_weights_on_device():
             pipe.dit = instantiate(dit_config).eval()  # inference
 
-        if dit_path:
-            state_dict = load_state_dict(dit_path)
-            prefix_to_load = "net_ema." if load_ema_to_reg else "net."
-
-            log.info(f"Loading {'[ema]/regular' if load_ema_to_reg else 'ema/[regular]'} weights from {dit_path}")
-            # drop net./net_ema. prefix if it exists, depending on the load_ema_to_reg flag
-            state_dict_dit_compatible = dict()
-            for k, v in state_dict.items():
-                if k.startswith(prefix_to_load):
-                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
-                else:
-                    state_dict_dit_compatible[k] = v
-            pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
-            del state_dict, state_dict_dit_compatible
-            log.success(f"Successfully loaded DiT from {dit_path}")
-
-        # 6-2. Handle EMA
         if config.ema.enabled:
             with init_weights_on_device():
                 pipe.dit_ema = instantiate(dit_config).eval()
             pipe.dit_ema.requires_grad_(False)
+        else:
+            pipe.dit_ema = None
 
+        if lora_injection_fn is not None:
+            log.info("Injecting LoRA adapters into action-conditioned DiT prior to loading weights.")
+            lora_injection_fn(pipe.dit)
+            if pipe.dit_ema is not None:
+                lora_injection_fn(pipe.dit_ema)
+                pipe.dit_ema.requires_grad_(False)
+
+        if dit_path:
+            state_dict = load_state_dict(dit_path)
+            reg_state_dict, ema_state_dict = _prepare_dit_state_dicts(state_dict, load_ema_to_reg)
+
+            log.info(
+                f"Loading {'EMA' if load_ema_to_reg else 'regular'} weights into the action-conditioned DiT from {dit_path}"
+            )
+            reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
+            _log_state_dict_loading_summary("Action DiT", reg_state_dict.keys(), reg_result)
+
+            if pipe.dit_ema is not None and ema_state_dict:
+                ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
+                _log_state_dict_loading_summary("Action DiT EMA", ema_state_dict.keys(), ema_result)
+            elif pipe.dit_ema is not None:
+                log.warning(
+                    "EMA model is enabled for action-conditioned pipeline but no EMA weights were present; copying from current DiT."
+                )
+
+            del state_dict, reg_state_dict, ema_state_dict
+            log.success(f"Successfully loaded DiT from {dit_path}")
+
+        # 6-2. Handle EMA
+        if config.ema.enabled:
             pipe.dit_ema_worker = FastEmaModelUpdater()  # default when not using FSDP
 
             s = config.ema.rate
             pipe.ema_exp_coefficient = np.roots([1, 7, 16 - s**-2, 12 - s**-2]).real.max()
             # copying is only necessary when starting the training at iteration 0.
             # Actual state_dict should be loaded after the pipe is created.
-            pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
+            if dit_path and "ema_result" in locals():
+                log.info("EMA weights for action-conditioned model loaded from checkpoint; skipping initial copy from DiT.")
+            else:
+                pipe.dit_ema_worker.copy_to(src_model=pipe.dit, tgt_model=pipe.dit_ema)
 
         pipe.dit = pipe.dit.to(device=device, dtype=torch_dtype)
         torch.cuda.empty_cache()

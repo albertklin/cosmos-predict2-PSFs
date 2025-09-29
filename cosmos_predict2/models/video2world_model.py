@@ -13,9 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import collections
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 import attrs
@@ -32,8 +31,7 @@ from cosmos_predict2.configs.base.config_video2world import (
     get_cosmos_predict2_video2world_pipeline,
 )
 from cosmos_predict2.networks.model_weights_stats import WeightTrainingStat
-from cosmos_predict2.pipelines.video2world import Video2WorldPipeline
-from cosmos_predict2.utils.checkpointer import non_strict_load_model
+from cosmos_predict2.pipelines.video2world import Video2WorldPipeline, _prepare_dit_state_dicts
 from cosmos_predict2.utils.optim_instantiate import get_base_scheduler
 from cosmos_predict2.utils.torch_future import clip_grad_norm_
 from imaginaire.constants import get_cosmos_predict2_video2world_checkpoint
@@ -135,30 +133,29 @@ class Predict2Video2WorldModel(ImaginaireModel):
         else:
             self.data_parallel_size = 1
 
-        # New way to init pipe
-        self.pipe = Video2WorldPipeline.from_config(
-            config.pipe_config,
-            dit_path=config.model_manager_config.dit_path,
-        )
-
-        self.freeze_parameters()
+        lora_injection_fn: Callable[[torch.nn.Module], None] | None = None
         if config.train_architecture == "lora":
-            self.add_lora_to_model(
-                self.pipe.dit,
-                lora_rank=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                lora_target_modules=config.lora_target_modules,
-                init_lora_weights=config.init_lora_weights,
-            )
-            if self.pipe.dit_ema:
+            def _inject_lora(module: torch.nn.Module) -> None:
                 self.add_lora_to_model(
-                    self.pipe.dit_ema,
+                    module,
                     lora_rank=config.lora_rank,
                     lora_alpha=config.lora_alpha,
                     lora_target_modules=config.lora_target_modules,
                     init_lora_weights=config.init_lora_weights,
                 )
-            # Enhanced LoRA logging
+
+            lora_injection_fn = _inject_lora
+
+        # New way to init pipe
+        self.pipe = Video2WorldPipeline.from_config(
+            config.pipe_config,
+            dit_path=config.model_manager_config.dit_path,
+            lora_injection_fn=lora_injection_fn,
+        )
+
+        self.freeze_parameters()
+        if config.train_architecture == "lora":
+            self._prepare_lora_trainable_parameters()
             self._log_lora_statistics()
         else:
             self.pipe.denoising_model().requires_grad_(True)
@@ -212,6 +209,7 @@ class Predict2Video2WorldModel(ImaginaireModel):
         """
         optimizer = instantiate(optimizer_config, model=self.net)
         scheduler = get_base_scheduler(optimizer, self, scheduler_config)
+        self._log_training_overview(optimizer)
         return optimizer, scheduler
 
     # ------------------------ training hooks ------------------------
@@ -350,6 +348,100 @@ class Predict2Video2WorldModel(ImaginaireModel):
             log.info(f"  Total LoRA: {total_lora_params:,} parameters")
         else:
             log.warning("No LoRA parameters found in model")
+
+    def _prepare_lora_trainable_parameters(self) -> None:
+        """Enable gradients for LoRA parameters while keeping base weights frozen."""
+
+        if not hasattr(self.pipe, "dit"):
+            log.warning("LoRA preparation skipped because DiT module is not initialized.")
+            return
+
+        trainable_names: list[str] = []
+        for name, param in self.pipe.dit.named_parameters():
+            if "lora" in name.lower():
+                param.requires_grad_(True)
+                if param.dtype != torch.float32:
+                    param.data = param.data.to(torch.float32)
+                trainable_names.append(name)
+
+        if self.pipe.dit_ema is not None:
+            for name, param in self.pipe.dit_ema.named_parameters():
+                if "lora" in name.lower():
+                    param.requires_grad_(False)
+
+        if trainable_names:
+            preview = ", ".join(trainable_names[:8])
+            if len(trainable_names) > 8:
+                preview += f", ... (+{len(trainable_names) - 8} more)"
+            log.info(f"Enabled training for {len(trainable_names)} LoRA tensors: {preview}")
+        else:
+            log.warning(
+                "LoRA training requested but no LoRA parameters were detected on the DiT module."
+            )
+
+    @staticmethod
+    def _format_name_list(names: list[str], limit: int = 8) -> str:
+        if not names:
+            return "none"
+        if len(names) <= limit:
+            return ", ".join(names)
+        return ", ".join(names[:limit]) + f", ... (+{len(names) - limit} more)"
+
+    def _log_training_overview(self, optimizer: torch.optim.Optimizer | None = None) -> None:
+        """Log a summary of trainable parameters and optimizer learning rates."""
+
+        params = list(self.named_parameters())
+        trainable = [(name, param) for name, param in params if param.requires_grad]
+        frozen = [(name, param) for name, param in params if not param.requires_grad]
+
+        trainable_param_count = sum(param.numel() for _, param in trainable)
+        frozen_param_count = sum(param.numel() for _, param in frozen)
+
+        log.info("Training parameter summary:")
+        log.info(
+            f"  Trainable tensors: {len(trainable)} | parameters: {trainable_param_count:,}"
+        )
+        if trainable:
+            log.info(f"  Trainable names: {self._format_name_list([name for name, _ in trainable])}")
+
+        log.info(f"  Frozen tensors: {len(frozen)} | parameters: {frozen_param_count:,}")
+        if frozen:
+            log.info(f"  Frozen names: {self._format_name_list([name for name, _ in frozen])}")
+
+        if optimizer is None:
+            return
+
+        param_name_lookup = {id(param): name for name, param in params}
+        log.info("  Optimizer parameter groups:")
+        for idx, group in enumerate(optimizer.param_groups):
+            lr = group.get("lr", 0.0)
+            lr_str = f"{lr:.2e}" if isinstance(lr, (float, int)) else str(lr)
+            group_params: list[torch.nn.Parameter] = group.get("params", [])
+            total_group_params = sum(param.numel() for param in group_params)
+            trainable_group_params = sum(param.numel() for param in group_params if param.requires_grad)
+            group_names = [
+                param_name_lookup.get(id(param), "<unnamed>") for param in group_params if param.requires_grad
+            ]
+            log.info(
+                f"    Group {idx}: lr={lr_str} | trainable params={trainable_group_params:,} / {total_group_params:,} "
+                f"| tensors={self._format_name_list(group_names)}"
+            )
+
+    def _log_checkpoint_details(
+        self, label: str, keys: Iterable[str], results: _IncompatibleKeys
+    ) -> None:
+        keys = list(keys)
+        missing = list(results.missing_keys)
+        unexpected = list(results.unexpected_keys)
+        loaded_count = max(len(keys) - len(unexpected), 0)
+
+        log.info(
+            f"[{label}] Checkpoint load summary: loaded={loaded_count} | new={len(missing)} | unexpected={len(unexpected)}"
+        )
+        if missing:
+            log.info(f"[{label}] Newly initialized tensors: {self._format_name_list(missing)}")
+        if unexpected:
+            log.warning(f"[{label}] Unexpected checkpoint entries ignored: {self._format_name_list(unexpected)}")
 
     def setup_data_key(self) -> None:
         self.input_video_key = self.config.input_video_key  # by default it is video key for Video diffusion model
@@ -528,51 +620,38 @@ class Predict2Video2WorldModel(ImaginaireModel):
         return net_state_dict
 
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
-        """
-        Loads a state dictionary into the model and optionally its EMA counterpart.
-        Different from torch strict=False mode, the method will not raise error for unmatched state shape while raise warning.
+        """Load checkpoint weights into the DiT (and EMA) modules."""
 
-        Parameters:e
-            state_dict (Mapping[str, Any]): A dictionary containing separate state dictionaries for the model and
-                                            potentially for an EMA version of the model under the keys 'model' and 'ema', respectively.
-            strict (bool, optional): If True, the method will enforce that the keys in the state dict match exactly
-                                    those in the model and EMA model (if applicable). Defaults to True.
-            assign (bool, optional): If True and in strict mode, will assign the state dictionary directly rather than
-                                    matching keys one-by-one. This is typically used when loading parts of state dicts
-                                    or using customized loading procedures. Defaults to False.
-        """
-        _reg_state_dict = collections.OrderedDict()
-        _ema_state_dict = collections.OrderedDict()
-        for k, v in state_dict.items():
-            if k.startswith("net."):
-                _reg_state_dict[k.replace("net.", "")] = v
-            elif k.startswith("net_ema."):
-                _ema_state_dict[k.replace("net_ema.", "")] = v
+        reg_state_dict, ema_state_dict = _prepare_dit_state_dicts(state_dict, load_ema_to_reg=False)
 
-        state_dict = _reg_state_dict
+        reg_results: _IncompatibleKeys = self.pipe.dit.load_state_dict(
+            reg_state_dict, strict=strict, assign=assign
+        )
 
-        if strict:
-            reg_results: _IncompatibleKeys = self.pipe.dit.load_state_dict(
-                _reg_state_dict, strict=strict, assign=assign
-            )
-
-            if self.config.pipe_config.ema.enabled:
-                ema_results: _IncompatibleKeys = self.pipe.dit_ema.load_state_dict(
-                    _ema_state_dict, strict=strict, assign=assign
+        ema_results: _IncompatibleKeys | None = None
+        if self.config.pipe_config.ema.enabled and self.pipe.dit_ema is not None:
+            if ema_state_dict:
+                ema_results = self.pipe.dit_ema.load_state_dict(ema_state_dict, strict=strict, assign=assign)
+            else:
+                log.warning(
+                    "EMA weights were not found in the checkpoint; initializing EMA parameters from the current DiT state."
                 )
+                if hasattr(self.pipe, "dit_ema_worker") and self.pipe.dit_ema is not None:
+                    self.pipe.dit_ema_worker.copy_to(src_model=self.pipe.dit, tgt_model=self.pipe.dit_ema)
+                ema_results = _IncompatibleKeys([], [])
 
-            return _IncompatibleKeys(
-                missing_keys=reg_results.missing_keys
-                + (ema_results.missing_keys if self.config.pipe_config.ema.enabled else []),
-                unexpected_keys=reg_results.unexpected_keys
-                + (ema_results.unexpected_keys if self.config.pipe_config.ema.enabled else []),
-            )
-        else:
-            log.critical("load model in non-strict mode")
-            log.critical(non_strict_load_model(self.pipe.dit, _reg_state_dict), rank0_only=False)
-            if self.config.pipe_config.ema.enabled:
-                log.critical("load ema model in non-strict mode")
-                log.critical(non_strict_load_model(self.pipe.dit_ema, _ema_state_dict), rank0_only=False)
+        self._log_checkpoint_details("DiT", reg_state_dict.keys(), reg_results)
+        if ema_results is not None:
+            self._log_checkpoint_details("DiT EMA", ema_state_dict.keys(), ema_results)
+
+        missing_keys = list(reg_results.missing_keys)
+        unexpected_keys = list(reg_results.unexpected_keys)
+
+        if ema_results is not None:
+            missing_keys.extend(ema_results.missing_keys)
+            unexpected_keys.extend(ema_results.unexpected_keys)
+
+        return _IncompatibleKeys(missing_keys=missing_keys, unexpected_keys=unexpected_keys)
 
     # ------------------ public methods ------------------
     def ema_beta(self, iteration: int) -> float:

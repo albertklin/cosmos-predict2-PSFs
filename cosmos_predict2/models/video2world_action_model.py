@@ -14,10 +14,12 @@
 # limitations under the License.
 
 import math
+from collections.abc import Mapping
 
 import torch
 from megatron.core import parallel_state
 from torch.distributed.device_mesh import init_device_mesh
+from torch.nn.modules.module import _IncompatibleKeys
 
 from cosmos_predict2.models.video2world_model import Predict2Video2WorldModel, Predict2Video2WorldModelConfig
 from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
@@ -60,31 +62,32 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
         else:
             self.data_parallel_size = 1
 
-        # NOTE: replace the pipeline with action-conditioned setup
-        self.pipe = Video2WorldActionConditionedPipeline.from_config(
-            config.pipe_config,
-            dit_path=config.model_manager_config.dit_path,
-        )
-
-        self.freeze_parameters()
-        self._enable_action_heads_training()
+        lora_injection_fn = None
         if config.train_architecture == "lora":
-            self.add_lora_to_model(
-                self.pipe.dit,
-                lora_rank=config.lora_rank,
-                lora_alpha=config.lora_alpha,
-                lora_target_modules=config.lora_target_modules,
-                init_lora_weights=config.init_lora_weights,
-            )
-            if self.pipe.dit_ema:
+            def _inject_lora(module: torch.nn.Module) -> None:
                 self.add_lora_to_model(
-                    self.pipe.dit_ema,
+                    module,
                     lora_rank=config.lora_rank,
                     lora_alpha=config.lora_alpha,
                     lora_target_modules=config.lora_target_modules,
                     init_lora_weights=config.init_lora_weights,
                 )
+
+            lora_injection_fn = _inject_lora
+
+        # NOTE: replace the pipeline with action-conditioned setup
+        self.pipe = Video2WorldActionConditionedPipeline.from_config(
+            config.pipe_config,
+            dit_path=config.model_manager_config.dit_path,
+            lora_injection_fn=lora_injection_fn,
+        )
+
+        self.freeze_parameters()
+        self._enable_action_heads_training()
+        if config.train_architecture == "lora":
+            self._prepare_lora_trainable_parameters()
             self._enable_action_heads_training()
+            self._log_lora_statistics()
         else:
             self.pipe.denoising_model().requires_grad_(True)
         total_params = sum(p.numel() for p in self.parameters())
@@ -118,6 +121,7 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
         optimizer = instantiate(optimizer_config, model=self.net)
         self._configure_action_head_param_group(optimizer)
         scheduler = get_base_scheduler(optimizer, self, scheduler_config)
+        self._log_training_overview(optimizer)
         return optimizer, scheduler
 
     # ------------------------ helpers ------------------------
@@ -172,3 +176,34 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
             f"lr={action_head_lr:.2e} (multiplier {multiplier:.2f}x base) "
             f"| params={action_param_count}"
         )
+
+    def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False):
+        results = super().load_state_dict(state_dict, strict=strict, assign=assign)
+        if isinstance(results, _IncompatibleKeys):
+            self._reinitialize_missing_action_heads(results)
+        return results
+
+    def _reinitialize_missing_action_heads(self, load_results: _IncompatibleKeys) -> None:
+        missing = set(load_results.missing_keys)
+        if not missing:
+            return
+
+        reinitialized: list[str] = []
+        for attr in ("action_embedder_B_D", "action_embedder_B_3D"):
+            module = getattr(self.pipe.dit, attr, None)
+            if module is None:
+                continue
+            prefix = f"{attr}."
+            if any(key.startswith(prefix) for key in missing):
+                if hasattr(module, "reset_parameters"):
+                    module.reset_parameters()
+                    reinitialized.append(attr)
+                    if self.pipe.dit_ema is not None and hasattr(self.pipe.dit_ema, attr):
+                        getattr(self.pipe.dit_ema, attr).reset_parameters()
+
+        if reinitialized:
+            self._enable_action_heads_training()
+            log.info(
+                "Action-conditioned checkpoint missing head weights; reinitialized modules: "
+                + ", ".join(reinitialized)
+            )

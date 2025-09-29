@@ -38,37 +38,6 @@ _VIDEO_EXTENSIONS = [".mp4"]
 NUM_CONDITIONAL_FRAMES_KEY: str = "num_conditional_frames"
 
 
-def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device | str = "cpu") -> None:
-    """Materialize meta tensors in ``module`` on the given ``device``.
-
-    When modules are instantiated under the ``meta`` device (via
-    :func:`init_weights_on_device`), any parameter/buffer that does not get
-    populated from a checkpoint will remain on the meta device. Accessing them
-    later (e.g., moving the module to a real device) would fail because they do
-    not own any storage.  This helper walks the module tree, replacing those
-    tensors with empty tensors allocated on ``device`` so that they can be
-    initialized explicitly.
-    """
-
-    for name, param in module._parameters.items():
-        if param is None or not isinstance(param, torch.nn.Parameter):
-            continue
-        if getattr(param, "is_meta", False):
-            module._parameters[name] = torch.nn.Parameter(
-                torch.empty(param.shape, device=device, dtype=param.dtype),
-                param.requires_grad,
-            )
-
-    for name, buffer in module._buffers.items():
-        if buffer is None or not isinstance(buffer, torch.Tensor):
-            continue
-        if getattr(buffer, "is_meta", False):
-            module._buffers[name] = torch.empty(buffer.shape, device=device, dtype=buffer.dtype)
-
-    for child in module.children():
-        _materialize_meta_tensors(child, device=device)
-
-
 class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
     def __init__(self, device: str = "cuda", torch_dtype: torch.dtype = torch.bfloat16):
         super().__init__(device=device, torch_dtype=torch_dtype)
@@ -165,101 +134,21 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
             prefix_to_load = "net_ema." if load_ema_to_reg else "net."
 
             log.info(f"Loading {'[ema]/regular' if load_ema_to_reg else 'ema/[regular]'} weights from {dit_path}")
-
-            def _normalize_dit_key(key: str) -> str:
-                if key.startswith(prefix_to_load):
-                    key = key[len(prefix_to_load) :]
-                if key.startswith("module."):
-                    return key[len("module.") :]
-                if key.startswith("module_ema."):
-                    return key[len("module_ema.") :]
-                return key
-
-            state_dict_dit_compatible = {
-                _normalize_dit_key(k): v for k, v in state_dict.items()
-            }
-
-            dit_param_names = {name for name, _ in pipe.dit.named_parameters()}
-            dit_buffer_names = {name for name, _ in pipe.dit.named_buffers()}
-            dit_expected_keys = dit_param_names | dit_buffer_names
-            dit_checkpoint_keys = set(state_dict_dit_compatible.keys())
-            dit_matched_keys = dit_expected_keys & dit_checkpoint_keys
-            dit_missing_keys = sorted(dit_expected_keys - dit_matched_keys)
-            dit_unexpected_keys = sorted(dit_checkpoint_keys - dit_expected_keys)
-
-            log.info(
-                f"Normalized action-conditioned DiT checkpoint tensors from {dit_path}: "
-                f"matched {len(dit_matched_keys)}/{len(dit_expected_keys)} expected params/buffers; "
-                f"unexpected={len(dit_unexpected_keys)}"
-            )
-            if dit_unexpected_keys:
-                log.warning(
-                    f"Action-conditioned DiT checkpoint at {dit_path} has unexpected tensors after normalization: "
-                    f"{dit_unexpected_keys[:10]}{'...' if len(dit_unexpected_keys) > 10 else ''}"
-                )
-            if dit_missing_keys:
-                log.warning(
-                    f"Action-conditioned DiT checkpoint at {dit_path} is missing tensors after normalization: "
-                    f"{dit_missing_keys[:10]}{'...' if len(dit_missing_keys) > 10 else ''}"
-                )
+            # drop net./net_ema. prefix if it exists, depending on the load_ema_to_reg flag
+            state_dict_dit_compatible = dict()
+            for k, v in state_dict.items():
+                if k.startswith(prefix_to_load):
+                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
+                else:
+                    state_dict_dit_compatible[k] = v
             pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
             del state_dict, state_dict_dit_compatible
             log.success(f"Successfully loaded DiT from {dit_path}")
-
-            action_embedder_B_D_missing = False
-            action_embedder_B_3D_missing = False
-            if hasattr(pipe.dit, "action_embedder_B_D"):
-                action_embedder_B_D_missing = pipe.dit.action_embedder_B_D.fc1.weight.is_meta
-            if hasattr(pipe.dit, "action_embedder_B_3D"):
-                action_embedder_B_3D_missing = pipe.dit.action_embedder_B_3D.fc1.weight.is_meta
-
-            # Report any tensors that remain on the meta device after loading the checkpoint.
-            uninitialized_params = [
-                name
-                for name, param in pipe.dit.named_parameters()
-                if getattr(param, "is_meta", False)
-            ]
-            uninitialized_buffers = [
-                name
-                for name, buf in pipe.dit.named_buffers()
-                if getattr(buf, "is_meta", False)
-            ]
-            if uninitialized_params or uninitialized_buffers:
-                log.warning(
-                    f"Action-conditioned DiT tensors left on the meta device after loading {dit_path}; "
-                    f"materializing params={uninitialized_params} buffers={uninitialized_buffers}",
-                )
-                _materialize_meta_tensors(pipe.dit)
-                remaining_meta = [
-                    name
-                    for name, param in pipe.dit.named_parameters()
-                    if getattr(param, "is_meta", False)
-                ]
-                remaining_meta += [
-                    name
-                    for name, buf in pipe.dit.named_buffers()
-                    if getattr(buf, "is_meta", False)
-                ]
-                if remaining_meta:
-                    raise RuntimeError(
-                        f"Failed to materialize action-conditioned DiT tensors after loading {dit_path}: {remaining_meta}"
-                    )
-                log.info(
-                    f"Materialized action-conditioned DiT tensors with empty CPU storage so training can resume from {dit_path}"
-                )
-            else:
-                log.info(f"All action-conditioned DiT tensors were materialized by the checkpoint at {dit_path}")
-
-            if action_embedder_B_D_missing:
-                pipe.dit.action_embedder_B_D.reset_parameters()
-            if action_embedder_B_3D_missing:
-                pipe.dit.action_embedder_B_3D.reset_parameters()
 
         # 6-2. Handle EMA
         if config.ema.enabled:
             with init_weights_on_device():
                 pipe.dit_ema = instantiate(dit_config).eval()
-            _materialize_meta_tensors(pipe.dit_ema)
             pipe.dit_ema.requires_grad_(False)
 
             pipe.dit_ema_worker = FastEmaModelUpdater()  # default when not using FSDP

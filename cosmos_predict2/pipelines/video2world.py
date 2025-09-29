@@ -51,29 +51,6 @@ from imaginaire.utils import log, misc
 from imaginaire.utils.easy_io import easy_io
 from imaginaire.utils.ema import FastEmaModelUpdater
 
-
-def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device | str = "cpu") -> None:
-    """Ensure tensors instantiated on the meta device receive real storage.
-
-    Recursively walks ``module`` and replaces every parameter/buffer that still
-    lives on the meta device with an empty tensor on ``device`` preserving the
-    original dtype and shape. This mirrors the helpers used by the
-    action-conditioned pipeline so we can safely construct large DiT variants
-    without running their expensive initializers when we know checkpoint
-    weights will be loaded immediately afterwards.
-    """
-
-    for name, param in module._parameters.items():
-        if param is not None and param.is_meta:
-            module._parameters[name] = torch.empty_like(param, device=device)
-
-    for name, buf in module._buffers.items():
-        if buf is not None and buf.is_meta:
-            module._buffers[name] = torch.empty_like(buf, device=device)
-
-    for child in module.children():
-        _materialize_meta_tensors(child, device=device)
-
 IS_PREPROCESSED_KEY = "is_preprocessed"
 _IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", "webp"]
 _VIDEO_EXTENSIONS = [".mp4"]
@@ -384,58 +361,14 @@ class Video2WorldPipeline(BasePipeline):
         if dit_path:
             state_dict = load_state_dict(dit_path)
             prefix_to_load = "net_ema." if load_ema_to_reg else "net."
-            # drop net. prefix and normalize potential FSDP module prefixes
-            def _normalize_dit_key(key: str) -> str:
-                if key.startswith(prefix_to_load):
-                    key = key[len(prefix_to_load) :]
-                    if key.startswith("module."):
-                        key = key[len("module.") :]
-                    elif key.startswith("module_ema."):
-                        key = key[len("module_ema.") :]
-                return key
-
-            state_dict_dit_compatible = {
-                _normalize_dit_key(k): v for k, v in state_dict.items()
-            }
+            # drop net. prefix
+            state_dict_dit_compatible = dict()
+            for k, v in state_dict.items():
+                if k.startswith(prefix_to_load):
+                    state_dict_dit_compatible[k[len(prefix_to_load) :]] = v
+                else:
+                    state_dict_dit_compatible[k] = v
             pipe.dit.load_state_dict(state_dict_dit_compatible, strict=False, assign=True)
-
-            # Report any tensors that remain on the meta device after loading the checkpoint.
-            uninitialized_params = [
-                name
-                for name, param in pipe.dit.named_parameters()
-                if getattr(param, "is_meta", False)
-            ]
-            uninitialized_buffers = [
-                name
-                for name, buf in pipe.dit.named_buffers()
-                if getattr(buf, "is_meta", False)
-            ]
-            if uninitialized_params or uninitialized_buffers:
-                log.warning(
-                    f"DiT tensors left on the meta device after loading {dit_path}; "
-                    f"materializing params={uninitialized_params} buffers={uninitialized_buffers}",
-                )
-                _materialize_meta_tensors(pipe.dit)
-                # Verify that all tensors have real storage before EMA initialization.
-                remaining_meta = [
-                    name
-                    for name, param in pipe.dit.named_parameters()
-                    if getattr(param, "is_meta", False)
-                ]
-                remaining_meta += [
-                    name
-                    for name, buf in pipe.dit.named_buffers()
-                    if getattr(buf, "is_meta", False)
-                ]
-                if remaining_meta:
-                    raise RuntimeError(
-                        f"Failed to materialize DiT tensors after loading {dit_path}: {remaining_meta}"
-                    )
-                log.info(
-                    f"Materialized DiT tensors with empty CPU storage so training can resume from {dit_path}"
-                )
-            else:
-                log.info(f"All DiT tensors were materialized by the checkpoint at {dit_path}")
             del state_dict, state_dict_dit_compatible
             log.success(f"Successfully loaded DiT from {dit_path}")
 
@@ -443,7 +376,6 @@ class Video2WorldPipeline(BasePipeline):
         if config.ema.enabled:
             with init_weights_on_device():
                 pipe.dit_ema = instantiate(dit_config).eval()
-            _materialize_meta_tensors(pipe.dit_ema)
             pipe.dit_ema.requires_grad_(False)
 
             pipe.dit_ema_worker = FastEmaModelUpdater()  # default when not using FSDP

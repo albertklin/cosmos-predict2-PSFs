@@ -23,6 +23,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.nn.modules.module import _IncompatibleKeys
 
 from cosmos_predict2.models.video2world_model import Predict2Video2WorldModel, Predict2Video2WorldModelConfig
+from cosmos_predict2.pipelines.video2world import _log_uninitialized_tensors
 from cosmos_predict2.pipelines.video2world_action import Video2WorldActionConditionedPipeline
 from cosmos_predict2.utils.optim_instantiate import get_base_scheduler
 from imaginaire.lazy_config import instantiate
@@ -83,6 +84,13 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
             lora_injection_fn=lora_injection_fn,
         )
 
+        def _log_weight_status(stage: str) -> None:
+            _log_uninitialized_tensors(self.pipe.dit, f"{stage} Action DiT")
+            if self.pipe.dit_ema is not None:
+                _log_uninitialized_tensors(self.pipe.dit_ema, f"{stage} Action DiT EMA")
+
+        _log_weight_status("Video2WorldActionModel (post-pipeline-init)")
+
         self.freeze_parameters()
         self._enable_action_heads_training()
         if config.train_architecture == "lora":
@@ -111,8 +119,10 @@ class Predict2Video2WorldActionConditionedModel(Predict2Video2WorldModel):
             )
             log.info(f"Using FSDP with shard size {fsdp_shard_size} | device mesh: {dp_mesh}")
             self.pipe.apply_fsdp(dp_mesh)
+            _log_weight_status("Video2WorldActionModel (post-FSDP)")
         else:
             log.info("FSDP (Fully Sharded Data Parallel) is disabled.")
+            _log_weight_status("Video2WorldActionModel (final)")
 
     def init_optimizer_scheduler(
         self,

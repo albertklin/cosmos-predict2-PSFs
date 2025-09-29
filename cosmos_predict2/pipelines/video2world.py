@@ -137,25 +137,28 @@ def _log_state_dict_loading_summary(
         log.warning(f"[{label}] Unexpected tensors ignored: {_format_parameter_names(unexpected)}")
 
 
+def _missing_key_prefix(key: str) -> str:
+    if "." in key:
+        return key.rsplit(".", 1)[0]
+    return ""
+
+
 def _initialize_missing_modules(
     module: torch.nn.Module | None, missing_keys: Iterable[str], label: str
-) -> None:
+) -> list[str]:
     if module is None:
-        return
+        return []
 
     missing_keys = list(missing_keys)
     if not missing_keys:
-        return
+        return []
 
     module_map = dict(module.named_modules())
     reset_modules: list[str] = []
     seen: set[torch.nn.Module] = set()
 
     for key in missing_keys:
-        if "." in key:
-            prefix = key.rsplit(".", 1)[0]
-        else:
-            prefix = ""
+        prefix = _missing_key_prefix(key)
 
         if prefix == "":
             continue
@@ -174,6 +177,66 @@ def _initialize_missing_modules(
         log.info(
             f"[{label}] Reinitialized modules for missing checkpoint entries: {_format_parameter_names(reset_modules)}"
         )
+
+    return reset_modules
+
+
+def _copy_missing_modules_from_source(
+    src_module: torch.nn.Module | None,
+    dst_module: torch.nn.Module | None,
+    missing_keys: Iterable[str],
+    candidate_prefixes: Iterable[str],
+    label: str,
+) -> set[str]:
+    if src_module is None or dst_module is None:
+        return set()
+
+    candidate_set = set(candidate_prefixes)
+    prefixes_to_copy = {
+        prefix
+        for prefix in (_missing_key_prefix(key) for key in missing_keys)
+        if prefix and prefix in candidate_set
+    }
+    if not prefixes_to_copy:
+        return set()
+
+    src_map = dict(src_module.named_modules())
+    dst_map = dict(dst_module.named_modules())
+    copied: list[str] = []
+
+    for prefix in sorted(prefixes_to_copy):
+        src_submodule = src_map.get(prefix)
+        dst_submodule = dst_map.get(prefix)
+        if src_submodule is None or dst_submodule is None:
+            continue
+
+        src_state = src_submodule.state_dict()
+        dst_submodule.load_state_dict(src_state)
+        dst_state = dst_submodule.state_dict()
+
+        mismatched: list[str] = []
+        for key, src_tensor in src_state.items():
+            dst_tensor = dst_state[key]
+            if torch.equal(src_tensor, dst_tensor):
+                continue
+            if torch.is_floating_point(src_tensor):
+                if torch.allclose(src_tensor, dst_tensor):
+                    continue
+            mismatched.append(key)
+
+        if mismatched:
+            raise RuntimeError(
+                f"Sanity check failed while copying module '{prefix}' for {label}: mismatched tensors {mismatched}"
+            )
+
+        copied.append(prefix)
+
+    if copied:
+        log.info(
+            f"[{label}] Copied parameters and buffers from DiT for missing modules: {_format_parameter_names(copied)}"
+        )
+
+    return set(copied)
 
 
 def resize_input(video: torch.Tensor, resolution: list[int]) -> torch.Tensor:
@@ -513,14 +576,23 @@ class Video2WorldPipeline(BasePipeline):
         if dit_path and load_before_injection:
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
+            reg_reset_modules: list[str] = []
             if isinstance(reg_result, _IncompatibleKeys):
-                _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "DiT")
+                reg_reset_modules = _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "DiT")
 
             if pipe.dit_ema is not None and ema_state_dict:
                 ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
                 _log_state_dict_loading_summary("DiT EMA", ema_state_dict.keys(), ema_result)
                 if isinstance(ema_result, _IncompatibleKeys):
-                    _initialize_missing_modules(pipe.dit_ema, ema_result.missing_keys, "DiT EMA")
+                    ema_missing_keys = list(ema_result.missing_keys)
+                    copied_prefixes = _copy_missing_modules_from_source(
+                        pipe.dit, pipe.dit_ema, ema_missing_keys, reg_reset_modules, "DiT EMA"
+                    )
+                    remaining_missing_keys = [
+                        key for key in ema_missing_keys if _missing_key_prefix(key) not in copied_prefixes
+                    ]
+                    if remaining_missing_keys:
+                        _initialize_missing_modules(pipe.dit_ema, remaining_missing_keys, "DiT EMA")
             elif pipe.dit_ema is not None:
                 log.warning(
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."
@@ -542,14 +614,23 @@ class Video2WorldPipeline(BasePipeline):
         if dit_path and not load_before_injection:
             reg_result = pipe.dit.load_state_dict(reg_state_dict, strict=False, assign=True)
             _log_state_dict_loading_summary("DiT", reg_state_dict.keys(), reg_result)
+            reg_reset_modules: list[str] = []
             if isinstance(reg_result, _IncompatibleKeys):
-                _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "DiT")
+                reg_reset_modules = _initialize_missing_modules(pipe.dit, reg_result.missing_keys, "DiT")
 
             if pipe.dit_ema is not None and ema_state_dict:
                 ema_result = pipe.dit_ema.load_state_dict(ema_state_dict, strict=False, assign=True)
                 _log_state_dict_loading_summary("DiT EMA", ema_state_dict.keys(), ema_result)
                 if isinstance(ema_result, _IncompatibleKeys):
-                    _initialize_missing_modules(pipe.dit_ema, ema_result.missing_keys, "DiT EMA")
+                    ema_missing_keys = list(ema_result.missing_keys)
+                    copied_prefixes = _copy_missing_modules_from_source(
+                        pipe.dit, pipe.dit_ema, ema_missing_keys, reg_reset_modules, "DiT EMA"
+                    )
+                    remaining_missing_keys = [
+                        key for key in ema_missing_keys if _missing_key_prefix(key) not in copied_prefixes
+                    ]
+                    if remaining_missing_keys:
+                        _initialize_missing_modules(pipe.dit_ema, remaining_missing_keys, "DiT EMA")
             elif pipe.dit_ema is not None:
                 log.warning(
                     "EMA model is enabled but no EMA weights were present in the checkpoint; initializing from current DiT state."

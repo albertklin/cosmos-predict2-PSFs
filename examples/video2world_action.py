@@ -412,6 +412,7 @@ def setup_pipeline(args: argparse.Namespace):
         model_size=args.model_size, resolution=args.resolution, fps=args.fps
     )
     config.resolution = args.resolution
+    config.net.action_dim=7*args.chunk_size
     if hasattr(args, "dit_path") and args.dit_path:
         dit_path = args.dit_path
     else:

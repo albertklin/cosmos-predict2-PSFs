@@ -49,6 +49,7 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
     defaults=[
         {"override /model": "predict2_v2w_14b_action_conditioned_fsdp"},
         {"override /optimizer": "fusedadamw"},
+        {"override /scheduler": "lambdalinear"},
         {"override /ckpt_type": "standard"},
         {"override /dataloader_train": "my16fps_action_train"},
         "_self_",
@@ -68,6 +69,15 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
     job=dict(
         group="action_conditioned",
         name="predict2_video2world_14b_action_conditioned_my16fps_${now:%Y-%m-%d}_${now:%H-%M-%S}",
+    ),
+    optimizer=dict(
+        lr=2 ** (-14.5),
+    ),
+    scheduler=dict(
+        f_max=[0.2],
+        f_min=[0.1],
+        warm_up_steps=[1_000],
+        cycle_lengths=[100_000],
     ),
     model_parallel=dict(
         context_parallel_size=8,

@@ -55,7 +55,7 @@ class Predict2Video2WorldModelConfig:
     lora_alpha: int = 16
     lora_target_modules: str = "q_proj,k_proj,v_proj,output_proj,mlp.layer1,mlp.layer2"
     init_lora_weights: bool = True
-    action_embedder_lr_multiplier: float = 10.0
+    action_embedder_lr_multiplier: float = 1.0
 
     precision: str = "bfloat16"
 

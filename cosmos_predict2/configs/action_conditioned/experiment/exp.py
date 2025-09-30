@@ -88,6 +88,9 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
     trainer=dict(
         distributed_parallelism="fsdp",
     ),
+    checkpoint=dict(
+        save_iter=5000,
+    ),
 )
 
 

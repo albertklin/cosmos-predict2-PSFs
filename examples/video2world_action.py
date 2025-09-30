@@ -265,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fps",
         type=int,
-        choices=CosmosPredict2ActionConditionedFPS.__args__,
+        # choices=CosmosPredict2ActionConditionedFPS.__args__,
         default=CosmosPredict2ActionConditionedFPS.__args__[0],
         help="Frame rate of the base model checkpoint to use",
     )

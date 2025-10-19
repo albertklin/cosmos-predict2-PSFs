@@ -616,10 +616,15 @@ def process_single_generation(
         chunk_grounding_flags: list[bool] = []
         num_action_steps = actions.shape[1]
         if num_action_steps < chunk_size:
-            raise ValueError(
+            # raise ValueError(
+            #     "Not enough action steps (%d) to form a single chunk of size %d"
+            #     % (num_action_steps, chunk_size)
+            # )
+            log.warning(
                 "Not enough action steps (%d) to form a single chunk of size %d"
                 % (num_action_steps, chunk_size)
             )
+            return
 
         remainder = num_action_steps % chunk_size
         if remainder != 0:

@@ -58,10 +58,10 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
         config=dict(
             fsdp_shard_size=8,
             pipe_config=dict(
-                state_t=16, # corresponds to num_frames=61; (16-1)*4 + 1 = 61
+                state_t=8, # corresponds to num_frames=29; (8-1)*4 + 1 = 29
                 resize_online=False,
                 net=dict(
-                    action_dim=7 * 60,
+                    action_dim=7 * 29,
                 ),
             ),
         )
@@ -89,7 +89,7 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
         distributed_parallelism="fsdp",
     ),
     checkpoint=dict(
-        save_iter=5000,
+        save_iter=1000,
     ),
 )
 

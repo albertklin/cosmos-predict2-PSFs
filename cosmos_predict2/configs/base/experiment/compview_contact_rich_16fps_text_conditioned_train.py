@@ -93,7 +93,7 @@ finetune_cosmos_cv_v2w_14b_compview_contact_rich_16fps_text_conditioned_train = 
         ),
     ),
     checkpoint=dict(
-        save_iter=5000,
+        save_iter=1000,
     ),
 )
 

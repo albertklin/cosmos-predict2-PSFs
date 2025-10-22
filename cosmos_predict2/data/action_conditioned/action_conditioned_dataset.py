@@ -345,7 +345,9 @@ class ActionConditionedDataset(Dataset):
             with open(ann_file) as f:
                 label = json.load(f)
             arm_states, gripper_states = self._get_robot_states(label, frame_ids)
-            actions = self._get_actions(arm_states, gripper_states, self.accumulate_action)
+            # actions = self._get_actions(arm_states, gripper_states, self.accumulate_action)
+            # GET ACTIONS DIRECTLY FROM ANNOTATION FILE
+            actions = torch.tensor(label["action"])[[fid-1 for fid in frame_ids[1:]]]
             actions *= self.c_act_scaler
 
             data = dict()

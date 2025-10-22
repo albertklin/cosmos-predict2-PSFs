@@ -18,7 +18,6 @@ import os
 from contextlib import contextmanager
 
 import torch
-from safetensors.torch import load as safetensors_torch_load
 
 from imaginaire.utils.easy_io import easy_io
 
@@ -73,23 +72,62 @@ def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = 
 
 
 def load_state_dict_from_folder(file_path, torch_dtype=None):
+    # Merge all compatible files inside the folder, but avoid loading base.* directly
+    # because per-file loader will already merge base into LoRA iter files.
     state_dict = {}
-    for file_name in os.listdir(file_path):
+    try:
+        entries = sorted(os.listdir(file_path))
+    except FileNotFoundError:
+        return state_dict
+    for file_name in entries:
+        if file_name in {"base.pt", "base.safetensors"}:
+            # Skip explicit base files to prevent overriding LoRA deltas due to ordering.
+            continue
         if "." in file_name and file_name.split(".")[-1] in ["safetensors", "bin", "ckpt", "pth", "pt"]:
             state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
     return state_dict
 
 
 def load_state_dict(file_path, torch_dtype=None):
+    # Support directory input: merge all compatible files inside the folder
+    if os.path.isdir(file_path):
+        return load_state_dict_from_folder(file_path, torch_dtype=torch_dtype)
+
     if file_path.endswith(".safetensors"):
-        return load_state_dict_from_safetensors(file_path, torch_dtype=torch_dtype)
+        sd = load_state_dict_from_safetensors(file_path, torch_dtype=torch_dtype)
     else:
-        return load_state_dict_from_bin(file_path, torch_dtype=torch_dtype)
+        sd = load_state_dict_from_bin(file_path, torch_dtype=torch_dtype)
+
+    # If a base checkpoint exists next to this file (from LoRA-split training),
+    # merge base weights first and then overlay with the provided state dict.
+    try:
+        folder = os.path.dirname(file_path)
+        base_candidates = [
+            os.path.join(folder, "base.safetensors"),
+            os.path.join(folder, "base.pt"),
+        ]
+        base_path = next((p for p in base_candidates if os.path.exists(p)), None)
+        if base_path is not None:
+            if base_path.endswith(".safetensors"):
+                base_sd = load_state_dict_from_safetensors(base_path, torch_dtype=torch_dtype)
+            else:
+                base_sd = load_state_dict_from_bin(base_path, torch_dtype=torch_dtype)
+            # Overlay sd on top of base_sd
+            merged = dict(base_sd)
+            merged.update(sd)
+            return merged
+    except Exception:
+        # Best-effort merge; if it fails, fall back to the loaded state dict
+        pass
+
+    return sd
 
 
 def load_state_dict_from_safetensors(file_path, torch_dtype=None):
+    # Import lazily to avoid hard dependency when safetensors isn't installed.
+    from safetensors.torch import load as safetensors_torch_load  # type: ignore
+
     backend_args = None
-    state_dict = {}
     byte_stream = easy_io.load(file_path, backend_args=backend_args, file_format="byte")
     state_dict = safetensors_torch_load(byte_stream)
     return state_dict

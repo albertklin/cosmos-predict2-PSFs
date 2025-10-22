@@ -104,6 +104,28 @@ class Checkpointer:
             folders = state_dicts_to_save.keys()
             for folder in folders:
                 state_dict = state_dicts_to_save[folder]
+
+                # LoRA-aware model checkpointing: save base weights once and per-iter LoRA deltas
+                if folder == "model" and getattr(model.config, "train_architecture", None) == "lora":
+                    model_dir = os.path.join(self.checkpoint_dir_local, "model")
+                    os.makedirs(model_dir, exist_ok=True)
+                    base_checkpoint_path = os.path.join(model_dir, "base.pt")
+
+                    # Split base vs LoRA keys
+                    lora_state = {k: v for k, v in state_dict.items() if "lora" in k.lower()}
+                    base_state = {k: v for k, v in state_dict.items() if "lora" not in k.lower()}
+
+                    # Save base once (idempotent)
+                    if not os.path.exists(base_checkpoint_path):
+                        try:
+                            torch.save(misc.to(base_state, device="cpu"), base_checkpoint_path)
+                            log.success(f"Saved base model checkpoint (local): {base_checkpoint_path}")
+                        except Exception as e:
+                            log.exception(f"Base checkpoint failed to save (local): {e}")
+
+                    # For this iteration checkpoint, only keep LoRA tensors
+                    state_dict = lora_state
+
                 state_dict = misc.to(state_dict, device="cpu")
                 # Wait for previous saver thread to end.
                 if self.save_thread:
@@ -210,6 +232,23 @@ class Checkpointer:
 
             # Load the state dicts.
             log.info("- Loading the model...")
+
+            # If running LoRA and a base checkpoint exists, merge base with the loaded (likely LoRA-only) checkpoint
+            if getattr(model.config, "train_architecture", None) == "lora":
+                model_dir = os.path.join(self.checkpoint_dir_local, "model")
+                base_candidates = [
+                    os.path.join(model_dir, "base.pt"),
+                ]
+                base_path = next((p for p in base_candidates if os.path.exists(p)), None)
+                if base_path is not None:
+                    try:
+                        base_sd = torch.load(base_path, map_location=lambda storage, loc: storage)
+                        merged = dict(base_sd)
+                        merged.update(state_dicts_to_load["model"])  # LoRA deltas override base
+                        state_dicts_to_load["model"] = merged
+                        log.info("Merged base model weights with LoRA deltas from checkpoint.")
+                    except Exception as e:
+                        log.exception(f"Failed to merge base and LoRA checkpoints: {e}")
 
             if is_fsdp:
                 # If a model is wrapped with FSDP, its underlying weights will be DTensor.

@@ -105,26 +105,87 @@ class Checkpointer:
             for folder in folders:
                 state_dict = state_dicts_to_save[folder]
 
-                # LoRA-aware model checkpointing: save base weights once and per-iter LoRA deltas
-                if folder == "model" and getattr(model.config, "train_architecture", None) == "lora":
-                    model_dir = os.path.join(self.checkpoint_dir_local, "model")
-                    os.makedirs(model_dir, exist_ok=True)
-                    base_checkpoint_path = os.path.join(model_dir, "base.pt")
+                # Space-efficient checkpointing: save frozen weights once and per-iter trainable/mutable deltas.
+                # Trainable keys are determined by optimizer param groups and any keys containing "ema" (EMA updates).
+                if folder == "model":
+                    try:
+                        model_dir = os.path.join(self.checkpoint_dir_local, "model")
+                        os.makedirs(model_dir, exist_ok=True)
 
-                    # Split base vs LoRA keys
-                    lora_state = {k: v for k, v in state_dict.items() if "lora" in k.lower()}
-                    base_state = {k: v for k, v in state_dict.items() if "lora" not in k.lower()}
+                        # Build mapping from Parameter id to its fully-qualified name
+                        id_to_name = {id(p): n for n, p in model.named_parameters(recurse=True)}
+                        trainable_names = set()
+                        # Include parameters that optimizer updates
+                        for pg in optimizer.param_groups:
+                            for p in pg.get("params", []):
+                                name = id_to_name.get(id(p))
+                                if name is not None:
+                                    trainable_names.add(name)
+                        # Also compute suffixes (after first '.') for robust EMA mapping
+                        trainable_suffixes = set()
+                        for name in trainable_names:
+                            if "." in name:
+                                trainable_suffixes.add(name.split(".", 1)[1])
+                            else:
+                                trainable_suffixes.add(name)
+                        # Additionally include EMA-related tensors by key pattern
+                        def is_trainable_key(k: str) -> bool:
+                            # Direct match
+                            if k in trainable_names:
+                                return True
+                            # Suffix match (handles prefixes like 'net.' or wrappers)
+                            if "." in k and k.split(".", 1)[1] in trainable_suffixes:
+                                return True
+                            # EMA keys: only treat as trainable if their suffix maps to a trainable param
+                            if "ema" in k.lower():
+                                suffix = k.split(".", 1)[1] if "." in k else k
+                                return suffix in trainable_suffixes
+                            return False
 
-                    # Save base once (idempotent)
-                    if not os.path.exists(base_checkpoint_path):
-                        try:
-                            torch.save(misc.to(base_state, device="cpu"), base_checkpoint_path)
-                            log.success(f"Saved base model checkpoint (local): {base_checkpoint_path}")
-                        except Exception as e:
-                            log.exception(f"Base checkpoint failed to save (local): {e}")
+                        frozen_state = {}
+                        trainable_state = {}
+                        for k, v in state_dict.items():
+                            if is_trainable_key(k):
+                                trainable_state[k] = v
+                            else:
+                                frozen_state[k] = v
 
-                    # For this iteration checkpoint, only keep LoRA tensors
-                    state_dict = lora_state
+                        # Sanity-logging: parameter counts (match training logs) and tensor counts per split
+                        all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
+                        trainable_param_names = {n for n in all_param_names if n in trainable_names}
+                        frozen_param_names = all_param_names - trainable_param_names
+                        trainable_param_count = sum(
+                            p.numel() for n, p in model.named_parameters(recurse=True) if n in trainable_param_names
+                        )
+                        frozen_param_count = sum(
+                            p.numel() for n, p in model.named_parameters(recurse=True) if n in frozen_param_names
+                        )
+                        log.info(
+                            f"Checkpoint split -> frozen params: {frozen_param_count:,} | trainable params: {trainable_param_count:,}"
+                        )
+                        log.info(
+                            f"Saving-once tensors (frozen): {len(frozen_state)} | per-iter tensors (trainable): {len(trainable_state)}"
+                        )
+
+                        # Save frozen part once (idempotent)
+                        frozen_checkpoint_path = os.path.join(model_dir, "frozen.pt")
+                        if not os.path.exists(frozen_checkpoint_path) and len(frozen_state) > 0:
+                            try:
+                                torch.save(misc.to(frozen_state, device="cpu"), frozen_checkpoint_path)
+                                log.success(f"Saved frozen model checkpoint (local): {frozen_checkpoint_path}")
+                            except Exception as e:
+                                log.exception(f"Frozen checkpoint failed to save (local): {e}")
+
+                        # For this iteration checkpoint, only keep trainable/mutable tensors if there is a meaningful split
+                        if len(trainable_state) > 0 and len(frozen_state) > 0:
+                            state_dict = trainable_state
+                        else:
+                            # No split (e.g., full fine-tune) -> save full dict
+                            state_dict = state_dict
+                    except Exception as e:
+                        log.exception(f"Failed to split trainable/frozen for checkpointing, falling back to full save: {e}")
+                        # Fall back to full state dict
+                        state_dict = state_dict
 
                 state_dict = misc.to(state_dict, device="cpu")
                 # Wait for previous saver thread to end.
@@ -233,22 +294,18 @@ class Checkpointer:
             # Load the state dicts.
             log.info("- Loading the model...")
 
-            # If running LoRA and a base checkpoint exists, merge base with the loaded (likely LoRA-only) checkpoint
-            if getattr(model.config, "train_architecture", None) == "lora":
-                model_dir = os.path.join(self.checkpoint_dir_local, "model")
-                base_candidates = [
-                    os.path.join(model_dir, "base.pt"),
-                ]
-                base_path = next((p for p in base_candidates if os.path.exists(p)), None)
-                if base_path is not None:
-                    try:
-                        base_sd = torch.load(base_path, map_location=lambda storage, loc: storage)
-                        merged = dict(base_sd)
-                        merged.update(state_dicts_to_load["model"])  # LoRA deltas override base
-                        state_dicts_to_load["model"] = merged
-                        log.info("Merged base model weights with LoRA deltas from checkpoint.")
-                    except Exception as e:
-                        log.exception(f"Failed to merge base and LoRA checkpoints: {e}")
+            # If a frozen checkpoint exists, merge it with the loaded (likely trainable-only) checkpoint
+            model_dir = os.path.join(self.checkpoint_dir_local, "model")
+            base_path = os.path.join(model_dir, "frozen.pt")
+            if os.path.exists(base_path):
+                try:
+                    base_sd = torch.load(base_path, map_location=lambda storage, loc: storage)
+                    merged = dict(base_sd)
+                    merged.update(state_dicts_to_load["model"])  # trainable deltas override frozen/base
+                    state_dicts_to_load["model"] = merged
+                    log.info("Merged model weights with frozen checkpoint")
+                except Exception as e:
+                    log.exception(f"Failed to merge frozen and trainable checkpoints: {e}")
 
             if is_fsdp:
                 # If a model is wrapped with FSDP, its underlying weights will be DTensor.

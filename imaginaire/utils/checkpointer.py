@@ -73,26 +73,76 @@ class Checkpointer:
         if distributed.get_rank() == 0:
             # Prepare model state dict
             full_model_sd = model.state_dict()
-            # If training with LoRA, split base (frozen) and LoRA (trainable) tensors to reduce disk usage.
-            use_lora_split = getattr(getattr(model, "config", object()), "train_architecture", "base") == "lora"
 
-            if use_lora_split:
-                # Partition weights by key name: LoRA tensors contain "lora" in their parameter names.
-                lora_sd = {k: v for k, v in full_model_sd.items() if "lora" in k.lower()}
-                base_sd = {k: v for k, v in full_model_sd.items() if "lora" not in k.lower()}
+            # Generic space-efficient split: save frozen weights once and per-iter trainable/mutable deltas.
+            # Trainable keys are detected from optimizer param groups and any keys containing "ema".
+            try:
+                # Build mapping from Parameter id to its fully-qualified name
+                id_to_name = {id(p): n for n, p in model.named_parameters(recurse=True)}
+                trainable_names = set()
+                for pg in optimizer.param_groups:
+                    for p in pg.get("params", []):
+                        name = id_to_name.get(id(p))
+                        if name is not None:
+                            trainable_names.add(name)
 
-                # Save the base weights once per job as checkpoints/base.pt (do not touch latest_checkpoint.txt).
-                base_path = os.path.join(self.checkpoint_dir_local, "base.pt")
-                if not os.path.exists(base_path):
+                # Compute suffixes for robust mapping from EMA => base param names
+                trainable_suffixes = set()
+                for name in trainable_names:
+                    if "." in name:
+                        trainable_suffixes.add(name.split(".", 1)[1])
+                    else:
+                        trainable_suffixes.add(name)
+
+                def is_trainable_key(k: str) -> bool:
+                    if k in trainable_names:
+                        return True
+                    if "." in k and k.split(".", 1)[1] in trainable_suffixes:
+                        return True
+                    if "ema" in k.lower():
+                        suffix = k.split(".", 1)[1] if "." in k else k
+                        return suffix in trainable_suffixes
+                    return False
+
+                frozen_sd = {}
+                trainable_sd = {}
+                for k, v in full_model_sd.items():
+                    if is_trainable_key(k):
+                        trainable_sd[k] = v
+                    else:
+                        frozen_sd[k] = v
+
+                # Sanity-logging: parameter counts (to match training logs) and tensor counts per split
+                all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
+                trainable_param_names = {n for n in all_param_names if n in trainable_names}
+                frozen_param_names = all_param_names - trainable_param_names
+                trainable_param_count = sum(
+                    p.numel() for n, p in model.named_parameters(recurse=True) if n in trainable_param_names
+                )
+                frozen_param_count = sum(
+                    p.numel() for n, p in model.named_parameters(recurse=True) if n in frozen_param_names
+                )
+                log.info(
+                    f"Checkpoint split -> frozen params: {frozen_param_count:,} | trainable params: {trainable_param_count:,}"
+                )
+                log.info(
+                    f"Saving-once tensors (frozen): {len(frozen_sd)} | per-iter tensors (trainable): {len(trainable_sd)}"
+                )
+
+                # Save the frozen weights once per job as checkpoints/frozen.pt (do not touch latest_checkpoint.txt).
+                frozen_path = os.path.join(self.checkpoint_dir_local, "frozen.pt")
+                if not os.path.exists(frozen_path) and len(frozen_sd) > 0:
                     try:
                         os.makedirs(self.checkpoint_dir_local, exist_ok=True)
-                        torch.save(misc.to(base_sd, device="cpu"), base_path)
-                        log.success(f"Saved base checkpoint (local): {base_path}")
+                        torch.save(misc.to(frozen_sd, device="cpu"), frozen_path)
+                        log.success(f"Saved frozen checkpoint (local): {frozen_path}")
                     except Exception as e:
-                        log.exception(f"Failed to save base checkpoint (local): {e}")
+                        log.exception(f"Failed to save frozen checkpoint (local): {e}")
 
-                model_state_for_ckpt = lora_sd
-            else:
+                # If a meaningful split exists, only keep trainable tensors per-iteration
+                model_state_for_ckpt = trainable_sd if (len(trainable_sd) > 0 and len(frozen_sd) > 0) else full_model_sd
+            except Exception as e:
+                log.exception(f"Failed to split trainable/frozen for checkpointing; falling back to full save: {e}")
                 model_state_for_ckpt = full_model_sd
 
             state_dict = dict(
@@ -196,21 +246,17 @@ class Checkpointer:
             # Load the state dicts.
             log.info("- Loading the model...")
             model_state_dict = state_dict["model"]
-            # If this is a LoRA-split checkpoint (model dict likely contains only LoRA tensors),
-            # attempt to merge with base weights saved alongside as checkpoints/base.pt.
-            if getattr(getattr(model, "config", object()), "train_architecture", "base") == "lora":
-                # Heuristic: if a base checkpoint exists, always merge it (LoRA tensors will override correctly).
-                base_path = os.path.join(self.checkpoint_dir_local, "base.pt")
-                if os.path.exists(base_path):
-                    try:
-                        base_sd = torch.load(base_path, map_location=lambda storage, loc: storage)
-                        # Overlay LoRA tensors on top of base tensors
-                        merged_sd = dict(base_sd)
-                        merged_sd.update(model_state_dict)
-                        model_state_dict = merged_sd
-                        log.info("Merged LoRA checkpoint with base weights from base.pt")
-                    except Exception as e:
-                        log.exception(f"Failed to merge base checkpoint: {e}")
+            # If a frozen checkpoint exists, merge it with the current (likely trainable-only) checkpoint
+            frozen_path = os.path.join(self.checkpoint_dir_local, "frozen.pt")
+            if os.path.exists(frozen_path):
+                try:
+                    base_sd = torch.load(frozen_path, map_location=lambda storage, loc: storage)
+                    merged_sd = dict(base_sd)
+                    merged_sd.update(model_state_dict)
+                    model_state_dict = merged_sd
+                    log.info("Merged checkpoint with frozen weights")
+                except Exception as e:
+                    log.exception(f"Failed to merge frozen checkpoint: {e}")
 
             model.load_state_dict(model_state_dict, strict=self.strict_resume)
             if resume or only_resume_scheduler:

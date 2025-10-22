@@ -72,16 +72,16 @@ def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = 
 
 
 def load_state_dict_from_folder(file_path, torch_dtype=None):
-    # Merge all compatible files inside the folder, but avoid loading base.* directly
-    # because per-file loader will already merge base into LoRA iter files.
+    # Merge all compatible files inside the folder, but avoid loading frozen.* directly
+    # because per-file loader will already merge these into iter files.
     state_dict = {}
     try:
         entries = sorted(os.listdir(file_path))
     except FileNotFoundError:
         return state_dict
     for file_name in entries:
-        if file_name in {"base.pt", "base.safetensors"}:
-            # Skip explicit base files to prevent overriding LoRA deltas due to ordering.
+        if file_name in {"frozen.pt", "frozen.safetensors"}:
+            # Skip explicit frozen files to prevent overriding trainable deltas due to ordering.
             continue
         if "." in file_name and file_name.split(".")[-1] in ["safetensors", "bin", "ckpt", "pth", "pt"]:
             state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
@@ -98,13 +98,13 @@ def load_state_dict(file_path, torch_dtype=None):
     else:
         sd = load_state_dict_from_bin(file_path, torch_dtype=torch_dtype)
 
-    # If a base checkpoint exists next to this file (from LoRA-split training),
-    # merge base weights first and then overlay with the provided state dict.
+    # If a frozen checkpoint exists next to this file (from split training),
+    # merge frozen weights first and then overlay with the provided state dict.
     try:
         folder = os.path.dirname(file_path)
         base_candidates = [
-            os.path.join(folder, "base.safetensors"),
-            os.path.join(folder, "base.pt"),
+            os.path.join(folder, "frozen.safetensors"),
+            os.path.join(folder, "frozen.pt"),
         ]
         base_path = next((p for p in base_candidates if os.path.exists(p)), None)
         if base_path is not None:

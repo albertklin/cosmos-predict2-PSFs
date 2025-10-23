@@ -75,33 +75,39 @@ class Checkpointer:
             full_model_sd = model.state_dict()
 
             # Generic space-efficient split: save frozen weights once and per-iter trainable/mutable deltas.
-            # Trainable keys are detected from optimizer param groups and any keys containing "ema".
+            # Trainable keys are detected from optimizer param groups with robust name normalization.
             try:
                 # Build mapping from Parameter id to its fully-qualified name
                 id_to_name = {id(p): n for n, p in model.named_parameters(recurse=True)}
-                trainable_names = set()
+
+                # Normalization helper to align named_parameters() and state_dict() keys
+                def normalize_name(name: str) -> str:
+                    if name.startswith("net."):
+                        return name.split(".", 1)[1]
+                    if name.startswith("net_ema."):
+                        return name.split(".", 1)[1]
+                    if ".dit." in name:
+                        return name.split(".dit.", 1)[1]
+                    if ".dit_ema." in name:
+                        return name.split(".dit_ema.", 1)[1]
+                    return name.split(".", 1)[1] if "." in name else name
+
+                trainable_suffixes = set()
+                raw_trainable_names = set()
                 for pg in optimizer.param_groups:
                     for p in pg.get("params", []):
-                        name = id_to_name.get(id(p))
-                        if name is not None:
-                            trainable_names.add(name)
-
-                # Compute suffixes for robust mapping from EMA => base param names
-                trainable_suffixes = set()
-                for name in trainable_names:
-                    if "." in name:
-                        trainable_suffixes.add(name.split(".", 1)[1])
-                    else:
-                        trainable_suffixes.add(name)
+                        raw = id_to_name.get(id(p))
+                        if raw is None:
+                            continue
+                        raw_trainable_names.add(raw)
+                        trainable_suffixes.add(normalize_name(raw))
 
                 def is_trainable_key(k: str) -> bool:
-                    if k in trainable_names:
-                        return True
-                    if "." in k and k.split(".", 1)[1] in trainable_suffixes:
+                    k_norm = normalize_name(k)
+                    if k_norm in trainable_suffixes:
                         return True
                     if "ema" in k.lower():
-                        suffix = k.split(".", 1)[1] if "." in k else k
-                        return suffix in trainable_suffixes
+                        return k_norm in trainable_suffixes
                     return False
 
                 frozen_sd = {}
@@ -114,7 +120,7 @@ class Checkpointer:
 
                 # Sanity-logging: parameter counts (to match training logs) and tensor counts per split
                 all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
-                trainable_param_names = {n for n in all_param_names if n in trainable_names}
+                trainable_param_names = {n for n in all_param_names if n in raw_trainable_names}
                 frozen_param_names = all_param_names - trainable_param_names
                 trainable_param_count = sum(
                     p.numel() for n, p in model.named_parameters(recurse=True) if n in trainable_param_names

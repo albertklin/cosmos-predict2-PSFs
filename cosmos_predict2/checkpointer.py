@@ -114,32 +114,43 @@ class Checkpointer:
 
                         # Build mapping from Parameter id to its fully-qualified name
                         id_to_name = {id(p): n for n, p in model.named_parameters(recurse=True)}
-                        trainable_names = set()
-                        # Include parameters that optimizer updates
+
+                        # Helper to normalize names so they can be matched between
+                        # model.named_parameters() and state_dict() keys. We drop the
+                        # top-level prefixes and anchor at {dit, dit_ema, net, net_ema}.
+                        def normalize_name(name: str) -> str:
+                            # Fast path: if using state_dict keys with prefixes 'net.'/'net_ema.'
+                            if name.startswith("net."):
+                                return name.split(".", 1)[1]
+                            if name.startswith("net_ema."):
+                                return name.split(".", 1)[1]
+                            # Parameter names often look like 'pipe.dit....' or 'pipe.dit_ema....'
+                            if ".dit." in name:
+                                return name.split(".dit.", 1)[1]
+                            if ".dit_ema." in name:
+                                return name.split(".dit_ema.", 1)[1]
+                            # Fallback: drop the first component if any
+                            return name.split(".", 1)[1] if "." in name else name
+
+                        # Collect trainable parameter normalized suffixes (from optimizer param groups)
+                        trainable_suffixes = set()
+                        raw_trainable_names = set()
                         for pg in optimizer.param_groups:
                             for p in pg.get("params", []):
-                                name = id_to_name.get(id(p))
-                                if name is not None:
-                                    trainable_names.add(name)
-                        # Also compute suffixes (after first '.') for robust EMA mapping
-                        trainable_suffixes = set()
-                        for name in trainable_names:
-                            if "." in name:
-                                trainable_suffixes.add(name.split(".", 1)[1])
-                            else:
-                                trainable_suffixes.add(name)
-                        # Additionally include EMA-related tensors by key pattern
+                                raw_name = id_to_name.get(id(p))
+                                if raw_name is None:
+                                    continue
+                                raw_trainable_names.add(raw_name)
+                                trainable_suffixes.add(normalize_name(raw_name))
+
                         def is_trainable_key(k: str) -> bool:
-                            # Direct match
-                            if k in trainable_names:
+                            # Normalize state_dict key first
+                            k_norm = normalize_name(k)
+                            if k_norm in trainable_suffixes:
                                 return True
-                            # Suffix match (handles prefixes like 'net.' or wrappers)
-                            if "." in k and k.split(".", 1)[1] in trainable_suffixes:
-                                return True
-                            # EMA keys: only treat as trainable if their suffix maps to a trainable param
+                            # For EMA entries, we still compare by normalized suffix
                             if "ema" in k.lower():
-                                suffix = k.split(".", 1)[1] if "." in k else k
-                                return suffix in trainable_suffixes
+                                return k_norm in trainable_suffixes
                             return False
 
                         frozen_state = {}
@@ -152,7 +163,7 @@ class Checkpointer:
 
                         # Sanity-logging: parameter counts (match training logs) and tensor counts per split
                         all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
-                        trainable_param_names = {n for n in all_param_names if n in trainable_names}
+                        trainable_param_names = {n for n in all_param_names if n in raw_trainable_names}
                         frozen_param_names = all_param_names - trainable_param_names
                         trainable_param_count = sum(
                             p.numel() for n, p in model.named_parameters(recurse=True) if n in trainable_param_names
@@ -183,7 +194,9 @@ class Checkpointer:
                             # No split (e.g., full fine-tune) -> save full dict
                             state_dict = state_dict
                     except Exception as e:
-                        log.exception(f"Failed to split trainable/frozen for checkpointing, falling back to full save: {e}")
+                        log.exception(
+                            f"Failed to split trainable/frozen for checkpointing, falling back to full save: {e}"
+                        )
                         # Fall back to full state dict
                         state_dict = state_dict
 

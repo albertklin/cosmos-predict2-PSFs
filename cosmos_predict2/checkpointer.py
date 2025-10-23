@@ -144,7 +144,11 @@ class Checkpointer:
                                 trainable_suffixes.add(normalize_name(raw_name))
 
                         def is_trainable_key(k: str) -> bool:
-                            # Normalize state_dict key first
+                            # Treat any LoRA adapter tensors as trainable by construction to avoid
+                            # accidental omission due to naming normalization mismatches.
+                            if "lora" in k.lower():
+                                return True
+                            # Normalize state_dict key first and match against optimizer-derived names
                             k_norm = normalize_name(k)
                             if k_norm in trainable_suffixes:
                                 return True
@@ -155,11 +159,18 @@ class Checkpointer:
 
                         frozen_state = {}
                         trainable_state = {}
+                        lora_total = 0
+                        lora_trainable = 0
                         for k, v in state_dict.items():
                             if is_trainable_key(k):
                                 trainable_state[k] = v
+                                if "lora" in k.lower():
+                                    lora_total += 1
+                                    lora_trainable += 1
                             else:
                                 frozen_state[k] = v
+                                if "lora" in k.lower():
+                                    lora_total += 1
 
                         # Sanity-logging: parameter counts (match training logs) and tensor counts per split
                         all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
@@ -176,6 +187,20 @@ class Checkpointer:
                         )
                         log.info(
                             f"Saving-once tensors (frozen): {len(frozen_state)} | per-iter tensors (trainable): {len(trainable_state)}"
+                        )
+                        if lora_total > 0:
+                            log.info(
+                                f"LoRA tensors in state_dict: total={lora_total} | routed to per-iter={lora_trainable} | to frozen={lora_total - lora_trainable}"
+                            )
+                        # Additional sanity: number of parameters actually being saved (sum of tensor sizes)
+                        saved_frozen_param_count = sum(
+                            v.numel() for v in frozen_state.values() if isinstance(v, torch.Tensor)
+                        )
+                        saved_trainable_param_count = sum(
+                            v.numel() for v in trainable_state.values() if isinstance(v, torch.Tensor)
+                        )
+                        log.info(
+                            f"Actual saved params -> frozen: {saved_frozen_param_count:,} | per-iter: {saved_trainable_param_count:,}"
                         )
 
                         # Cast model tensors to bfloat16 on disk to reduce load-time memory and avoid FP32 spikes.

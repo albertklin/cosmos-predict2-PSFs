@@ -192,6 +192,12 @@ def setup_lora_pipeline(
     if dit_path:
         log.info(f"Loading LoRA checkpoint from {dit_path}")
         state_dict = load_state_dict(dit_path)
+        # Minimal safety check: if LoRA mode is requested but checkpoint has no LoRA weights, fail fast
+        has_lora = any("lora" in k.lower() for k in state_dict.keys())
+        if not has_lora:
+            raise RuntimeError(
+                f"LoRA inference requested (--use_lora) but checkpoint contains no LoRA weights: {dit_path}"
+            )
         # Split state dict for regular and EMA models
         state_dict_dit_regular = dict()
         state_dict_dit_ema = dict()

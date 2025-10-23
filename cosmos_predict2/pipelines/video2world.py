@@ -560,8 +560,29 @@ class Video2WorldPipeline(BasePipeline):
         ema_result: _IncompatibleKeys | None = None
 
         if dit_path:
+            # Heuristic: if the user selected a per-iteration delta file but there is no neighboring
+            # frozen.* base, warn early so we know merge cannot happen.
+            try:
+                from pathlib import Path as _P
+                p = _P(dit_path)
+                parent = p.parent
+                has_base = any((parent / n).exists() for n in ("frozen_bfloat16.pt", "frozen.safetensors", "frozen.pt"))
+                if p.is_file() and p.name.startswith("iter_") and not has_base:
+                    log.warning(
+                        "[CKPT] Selected an iteration delta checkpoint but no neighboring frozen.* base was found. "
+                        "Weights may be incomplete and produce poor outputs."
+                    )
+            except Exception:
+                pass
             state_dict = load_state_dict(dit_path)
             reg_state_dict, ema_state_dict = _prepare_dit_state_dicts(state_dict, load_ema_to_reg)
+            try:
+                from imaginaire.utils import log as _ilog
+                _ilog.info(
+                    f"[CKPT] Pipeline split: reg={len(reg_state_dict)} tensors | ema={len(ema_state_dict)} tensors"
+                )
+            except Exception:
+                pass
             checkpoint_has_lora = _state_dict_contains_lora_weights(reg_state_dict) or _state_dict_contains_lora_weights(
                 ema_state_dict
             )
@@ -641,6 +662,19 @@ class Video2WorldPipeline(BasePipeline):
 
         if dit_path and reg_result is not None:
             log.success(f"Successfully loaded DiT from {dit_path}")
+
+        # Extra post-load sanity logs
+        try:
+            named_params = list(pipe.dit.named_parameters())
+            if named_params:
+                sample = []
+                for n, p in named_params[:5]:
+                    with torch.no_grad():
+                        norm = float(p.float().norm().cpu()) if p.numel() > 0 else 0.0
+                    sample.append(f"{n} (shape={tuple(p.shape)}, ||p||~{norm:.4g})")
+                log.info("[CKPT] Sample parameter norms after load: " + ", ".join(sample))
+        except Exception:
+            pass
 
         # 6-2. Handle EMA
         if config.ema.enabled:

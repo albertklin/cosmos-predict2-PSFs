@@ -155,8 +155,29 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
         ema_result: _IncompatibleKeys | None = None
 
         if dit_path:
+            # Heuristic: if the user selected a per-iteration delta file but there is no neighboring
+            # frozen.* base, warn early so we know merge cannot happen.
+            try:
+                from pathlib import Path as _P
+                p = _P(dit_path)
+                parent = p.parent
+                has_base = any((parent / n).exists() for n in ("frozen_bfloat16.pt", "frozen.safetensors", "frozen.pt"))
+                if p.is_file() and p.name.startswith("iter_") and not has_base:
+                    log.warning(
+                        "[CKPT] Selected an iteration delta checkpoint but no neighboring frozen.* base was found. "
+                        "Weights may be incomplete and produce poor outputs in the action-conditioned pipeline."
+                    )
+            except Exception:
+                pass
             state_dict = load_state_dict(dit_path)
             reg_state_dict, ema_state_dict = _prepare_dit_state_dicts(state_dict, load_ema_to_reg)
+            try:
+                from imaginaire.utils import log as _ilog
+                _ilog.info(
+                    f"[CKPT] Action pipeline split: reg={len(reg_state_dict)} tensors | ema={len(ema_state_dict)} tensors"
+                )
+            except Exception:
+                pass
             checkpoint_has_lora = _state_dict_contains_lora_weights(reg_state_dict) or _state_dict_contains_lora_weights(
                 ema_state_dict
             )
@@ -244,6 +265,25 @@ class Video2WorldActionConditionedPipeline(Video2WorldPipeline):
 
         if dit_path and reg_result is not None:
             log.success(f"Successfully loaded DiT from {dit_path}")
+
+        # Extra post-load sanity logs focusing on action-related modules
+        try:
+            action_param_infos = []
+            for n, p in pipe.dit.named_parameters():
+                if "action" in n.lower():
+                    with torch.no_grad():
+                        norm = float(p.float().norm().cpu()) if p.numel() > 0 else 0.0
+                    action_param_infos.append((n, p.shape, norm))
+            if action_param_infos:
+                formatted = ", ".join([f"{n} (shape={tuple(s)}, ||p||~{norm:.4g})" for n, s, norm in action_param_infos[:5]])
+                log.info(
+                    f"[CKPT] Action params present: {len(action_param_infos)}. Sample: {formatted}"
+                    + (" ..." if len(action_param_infos) > 5 else "")
+                )
+            else:
+                log.warning("[CKPT] No action-related parameters detected in model after loading.")
+        except Exception:
+            pass
 
         # 6-2. Handle EMA
         if config.ema.enabled:

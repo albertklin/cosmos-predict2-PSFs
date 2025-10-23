@@ -74,21 +74,36 @@ def init_weights_on_device(device=torch.device("meta"), include_buffers: bool = 
 def load_state_dict_from_folder(file_path, torch_dtype=None):
     # Merge all compatible files inside the folder, but avoid loading frozen.* directly
     # because per-file loader will already merge these into iter files.
+    from imaginaire.utils import log
+
     state_dict = {}
     try:
         entries = sorted(os.listdir(file_path))
     except FileNotFoundError:
         return state_dict
+
+    compat_files = []
     for file_name in entries:
-        if file_name in {"frozen.pt", "frozen.safetensors"}:
+        if file_name in {"frozen.pt", "frozen.safetensors", "frozen_bfloat16.pt"}:
             # Skip explicit frozen files to prevent overriding trainable deltas due to ordering.
             continue
         if "." in file_name and file_name.split(".")[-1] in ["safetensors", "bin", "ckpt", "pth", "pt"]:
-            state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
+            compat_files.append(file_name)
+
+    if compat_files:
+        log.info(
+            f"[CKPT] Folder input detected: merging {len(compat_files)} files (skipping frozen.*): "
+            + ", ".join(sorted(compat_files)[:5])
+            + (" ..." if len(compat_files) > 5 else "")
+        )
+
+    for file_name in compat_files:
+        state_dict.update(load_state_dict(os.path.join(file_path, file_name), torch_dtype=torch_dtype))
     return state_dict
 
 
 def load_state_dict(file_path, torch_dtype=None):
+    from imaginaire.utils import log
     # Support directory input: merge all compatible files inside the folder
     if os.path.isdir(file_path):
         return load_state_dict_from_folder(file_path, torch_dtype=torch_dtype)
@@ -110,6 +125,10 @@ def load_state_dict(file_path, torch_dtype=None):
         ]
         base_path = next((p for p in base_candidates if os.path.exists(p)), None)
         if base_path is not None:
+            log.info(
+                f"[CKPT] Detected frozen base alongside '{os.path.basename(file_path)}': "
+                f"using '{os.path.basename(base_path)}' for base weights."
+            )
             if base_path.endswith(".safetensors"):
                 base_sd = load_state_dict_from_safetensors(base_path, torch_dtype=torch_dtype)
             else:
@@ -117,11 +136,35 @@ def load_state_dict(file_path, torch_dtype=None):
             # Overlay sd on top of base_sd
             merged = dict(base_sd)
             merged.update(sd)
+            # Sanity logging on merge sizes and dtype distribution
+            try:
+                base_cnt = len([k for k, v in base_sd.items() if isinstance(v, torch.Tensor)])
+                delta_cnt = len([k for k, v in sd.items() if isinstance(v, torch.Tensor)])
+                merged_cnt = len([k for k, v in merged.items() if isinstance(v, torch.Tensor)])
+                log.info(f"[CKPT] Merge sizes -> base={base_cnt} | delta={delta_cnt} | merged={merged_cnt}")
+                # Quick check for action-related tensors in delta
+                action_like = [k for k in sd.keys() if isinstance(k, str) and ("action" in k.lower())]
+                if action_like:
+                    log.info(
+                        f"[CKPT] Delta contains {len(action_like)} action-related tensors: "
+                        + ", ".join(sorted(action_like)[:5])
+                        + (" ..." if len(action_like) > 5 else "")
+                    )
+            except Exception:
+                pass
             return merged
     except Exception:
         # Best-effort merge; if it fails, fall back to the loaded state dict
         pass
 
+    # Final sanity log on returned state dict
+    try:
+        total_cnt = len([k for k, v in sd.items() if isinstance(v, torch.Tensor)])
+        net_cnt = len([k for k in sd.keys() if isinstance(k, str) and k.startswith("net.")])
+        ema_cnt = len([k for k in sd.keys() if isinstance(k, str) and k.startswith("net_ema.")])
+        log.info(f"[CKPT] Loaded standalone state_dict tensors: total={total_cnt} | net={net_cnt} | net_ema={ema_cnt}")
+    except Exception:
+        pass
     return sd
 
 

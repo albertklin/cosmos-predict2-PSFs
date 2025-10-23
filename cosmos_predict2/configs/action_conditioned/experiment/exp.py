@@ -58,10 +58,10 @@ predict2_video2world_14b_action_conditioned_training_my16fps = dict(
         config=dict(
             fsdp_shard_size=8,
             pipe_config=dict(
-                state_t=8, # corresponds to num_frames=29; (8-1)*4 + 1 = 29
+                state_t=16, # corresponds to num_frames=61; (16-1)*4 + 1 = 61; (num_frames is set in ../defaults/data.py)
                 resize_online=False,
                 net=dict(
-                    action_dim=7 * 29,
+                    action_dim=7 * 60, # 7 * (num_frames-1)
                 ),
             ),
         )

@@ -132,8 +132,8 @@ class ActionConditionedDataset(Dataset):
         self.accumulate_action = accumulate_action
 
         self.action_dim = 7  # ee xyz (3) + ee euler (3) + gripper(1)
-        self.c_act_scaler = [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 1.0]
-        self.c_act_scaler = np.array(self.c_act_scaler, dtype=float)
+        # self.c_act_scaler = [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 1.0]
+        # self.c_act_scaler = np.array(self.c_act_scaler, dtype=float)
         self.ann_files = self._init_anns(self.data_path)
 
         print(f"{len(self.ann_files)} trajectories in total")
@@ -348,7 +348,7 @@ class ActionConditionedDataset(Dataset):
             # actions = self._get_actions(arm_states, gripper_states, self.accumulate_action)
             # GET ACTIONS DIRECTLY FROM ANNOTATION FILE
             actions = torch.tensor(label["action"])[[fid-1 for fid in frame_ids[1:]]]
-            actions *= self.c_act_scaler
+            # actions *= self.c_act_scaler
 
             data = dict()
             if self.load_action:

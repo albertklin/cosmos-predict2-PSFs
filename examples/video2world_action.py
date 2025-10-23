@@ -240,7 +240,8 @@ def get_action_sequence(annotation_path):
         data = json.load(file)
 
     # rescale the action to the original scale
-    action_ee = np.array(data["action"])[:, :6] * 20
+    # action_ee = np.array(data["action"])[:, :6] * 20
+    action_ee = np.array(data["action"])[:, :6]
     gripper = np.array(data["continuous_gripper_state"])[1:, None]
 
     # concatenate the end-effector displacement and gripper width

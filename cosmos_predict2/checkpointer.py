@@ -178,6 +178,19 @@ class Checkpointer:
                             f"Saving-once tensors (frozen): {len(frozen_state)} | per-iter tensors (trainable): {len(trainable_state)}"
                         )
 
+                        # Cast model tensors to bfloat16 on disk to reduce load-time memory and avoid FP32 spikes.
+                        def cast_fp_to_bf16(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+                            out: dict[str, torch.Tensor] = {}
+                            for kk, vv in d.items():
+                                if isinstance(vv, torch.Tensor) and vv.is_floating_point():
+                                    out[kk] = vv.to(torch.bfloat16)
+                                else:
+                                    out[kk] = vv
+                            return out
+
+                        frozen_state = cast_fp_to_bf16(frozen_state)
+                        trainable_state = cast_fp_to_bf16(trainable_state)
+
                         # Save frozen part once (idempotent)
                         frozen_checkpoint_path = os.path.join(model_dir, "frozen.pt")
                         if not os.path.exists(frozen_checkpoint_path) and len(frozen_state) > 0:

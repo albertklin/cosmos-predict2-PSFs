@@ -102,7 +102,9 @@ def load_state_dict(file_path, torch_dtype=None):
     # merge frozen weights first and then overlay with the provided state dict.
     try:
         folder = os.path.dirname(file_path)
+        # Prefer a pre-converted BF16 frozen snapshot if present to avoid mixed dtypes
         base_candidates = [
+            os.path.join(folder, "frozen_bfloat16.pt"),
             os.path.join(folder, "frozen.safetensors"),
             os.path.join(folder, "frozen.pt"),
         ]
@@ -130,6 +132,10 @@ def load_state_dict_from_safetensors(file_path, torch_dtype=None):
     backend_args = None
     byte_stream = easy_io.load(file_path, backend_args=backend_args, file_format="byte")
     state_dict = safetensors_torch_load(byte_stream)
+    if torch_dtype is not None:
+        for k, v in list(state_dict.items()):
+            if isinstance(v, torch.Tensor):
+                state_dict[k] = v.to(torch_dtype)
     return state_dict
 
 

@@ -200,6 +200,16 @@ class Checkpointer:
                             except Exception as e:
                                 log.exception(f"Frozen checkpoint failed to save (local): {e}")
 
+                        # Drop a lightweight sentinel so inference can detect BF16
+                        # without opening large checkpoint files.
+                        try:
+                            sentinel = os.path.join(model_dir, "dtype_bfloat16.txt")
+                            if not os.path.exists(sentinel):
+                                with open(sentinel, "w") as f:
+                                    f.write("bfloat16\n")
+                        except Exception:
+                            pass
+
                         # For this iteration checkpoint, only keep trainable/mutable tensors if there is a meaningful split
                         if len(trainable_state) > 0 and len(frozen_state) > 0:
                             state_dict = trainable_state

@@ -158,6 +158,15 @@ class Checkpointer:
                     except Exception as e:
                         log.exception(f"Failed to save frozen checkpoint (local): {e}")
 
+                # Drop a lightweight sentinel so loaders can detect BF16 cheaply.
+                try:
+                    sentinel = os.path.join(self.checkpoint_dir_local, "dtype_bfloat16.txt")
+                    if not os.path.exists(sentinel):
+                        with open(sentinel, "w") as f:
+                            f.write("bfloat16\n")
+                except Exception:
+                    pass
+
                 # If a meaningful split exists, only keep trainable tensors per-iteration
                 model_state_for_ckpt = trainable_sd if (len(trainable_sd) > 0 and len(frozen_sd) > 0) else full_model_sd
             except Exception as e:

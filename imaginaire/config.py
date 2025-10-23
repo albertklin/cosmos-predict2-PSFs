@@ -284,6 +284,8 @@ class CheckpointConfig:
     load_ema_to_reg: bool = False
     # In dcp planner, skip the weight shape check, load weights into the model even weight shape is different
     dcp_allow_mismatched_size: bool = False
+    # Optional: Save full model checkpoint without splitting into frozen+per-iter deltas (for sanity checks)
+    save_full_model: bool = False
 
 
 @make_freezable

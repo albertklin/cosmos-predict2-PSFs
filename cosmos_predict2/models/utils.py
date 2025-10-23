@@ -142,13 +142,20 @@ def load_state_dict(file_path, torch_dtype=None):
                 delta_cnt = len([k for k, v in sd.items() if isinstance(v, torch.Tensor)])
                 merged_cnt = len([k for k, v in merged.items() if isinstance(v, torch.Tensor)])
                 log.info(f"[CKPT] Merge sizes -> base={base_cnt} | delta={delta_cnt} | merged={merged_cnt}")
-                # Quick check for action-related tensors in delta
+                # Quick checks for action-related and LoRA tensors in delta (deltas are the trainable-only split)
                 action_like = [k for k in sd.keys() if isinstance(k, str) and ("action" in k.lower())]
                 if action_like:
                     log.info(
                         f"[CKPT] Delta contains {len(action_like)} action-related tensors: "
                         + ", ".join(sorted(action_like)[:5])
                         + (" ..." if len(action_like) > 5 else "")
+                    )
+                lora_like = [k for k in sd.keys() if isinstance(k, str) and ("lora" in k.lower())]
+                if lora_like:
+                    log.info(
+                        f"[CKPT] Delta contains {len(lora_like)} LoRA tensors (showing up to 5): "
+                        + ", ".join(sorted(lora_like)[:5])
+                        + (" ..." if len(lora_like) > 5 else "")
                     )
             except Exception:
                 pass

@@ -52,6 +52,11 @@ class Checkpointer:
         self.load_training_state = config_checkpoint.load_training_state
         self.only_load_scheduler_state = config_checkpoint.only_load_scheduler_state
         self.save_thread = None
+        # Optional: allow disabling split checkpoints for fool-proof sanity checks.
+        # Prefer config flag if present, otherwise fallback to env var COSMOS_SAVE_FULL_MODEL.
+        self.save_full_model = bool(getattr(config_checkpoint, "save_full_model", False)) or str(
+            os.getenv("COSMOS_SAVE_FULL_MODEL", "false")
+        ).lower() in {"1", "true", "yes", "y"}
 
     def save(
         self,
@@ -112,135 +117,174 @@ class Checkpointer:
                         model_dir = os.path.join(self.checkpoint_dir_local, "model")
                         os.makedirs(model_dir, exist_ok=True)
 
-                        # Build mapping from Parameter id to its fully-qualified name
-                        id_to_name = {id(p): n for n, p in model.named_parameters(recurse=True)}
-
-                        # Helper to normalize names so they can be matched between
-                        # model.named_parameters() and state_dict() keys. We drop the
-                        # top-level prefixes and anchor at {dit, dit_ema, net, net_ema}.
-                        def normalize_name(name: str) -> str:
-                            # Fast path: if using state_dict keys with prefixes 'net.'/'net_ema.'
-                            if name.startswith("net."):
-                                return name.split(".", 1)[1]
-                            if name.startswith("net_ema."):
-                                return name.split(".", 1)[1]
-                            # Parameter names often look like 'pipe.dit....' or 'pipe.dit_ema....'
-                            if ".dit." in name:
-                                return name.split(".dit.", 1)[1]
-                            if ".dit_ema." in name:
-                                return name.split(".dit_ema.", 1)[1]
-                            # Fallback: drop the first component if any
-                            return name.split(".", 1)[1] if "." in name else name
-
-                        # Collect trainable parameter normalized suffixes (from optimizer param groups)
-                        trainable_suffixes = set()
-                        raw_trainable_names = set()
-                        for pg in optimizer.param_groups:
-                            for p in pg.get("params", []):
-                                raw_name = id_to_name.get(id(p))
-                                if raw_name is None:
-                                    continue
-                                raw_trainable_names.add(raw_name)
-                                trainable_suffixes.add(normalize_name(raw_name))
-
-                        def is_trainable_key(k: str) -> bool:
-                            # Treat any LoRA adapter tensors as trainable by construction to avoid
-                            # accidental omission due to naming normalization mismatches.
-                            if "lora" in k.lower():
-                                return True
-                            # Normalize state_dict key first and match against optimizer-derived names
-                            k_norm = normalize_name(k)
-                            if k_norm in trainable_suffixes:
-                                return True
-                            # For EMA entries, we still compare by normalized suffix
-                            if "ema" in k.lower():
-                                return k_norm in trainable_suffixes
-                            return False
-
-                        frozen_state = {}
-                        trainable_state = {}
-                        lora_total = 0
-                        lora_trainable = 0
-                        for k, v in state_dict.items():
-                            if is_trainable_key(k):
-                                trainable_state[k] = v
-                                if "lora" in k.lower():
-                                    lora_total += 1
-                                    lora_trainable += 1
-                            else:
-                                frozen_state[k] = v
-                                if "lora" in k.lower():
-                                    lora_total += 1
-
-                        # Sanity-logging: parameter counts (match training logs) and tensor counts per split
-                        all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
-                        trainable_param_names = {n for n in all_param_names if n in raw_trainable_names}
-                        frozen_param_names = all_param_names - trainable_param_names
-                        trainable_param_count = sum(
-                            p.numel() for n, p in model.named_parameters(recurse=True) if n in trainable_param_names
-                        )
-                        frozen_param_count = sum(
-                            p.numel() for n, p in model.named_parameters(recurse=True) if n in frozen_param_names
-                        )
-                        log.info(
-                            f"Checkpoint split -> frozen params: {frozen_param_count:,} | trainable params: {trainable_param_count:,}"
-                        )
-                        log.info(
-                            f"Saving-once tensors (frozen): {len(frozen_state)} | per-iter tensors (trainable): {len(trainable_state)}"
-                        )
-                        if lora_total > 0:
-                            log.info(
-                                f"LoRA tensors in state_dict: total={lora_total} | routed to per-iter={lora_trainable} | to frozen={lora_total - lora_trainable}"
-                            )
-                        # Additional sanity: number of parameters actually being saved (sum of tensor sizes)
-                        saved_frozen_param_count = sum(
-                            v.numel() for v in frozen_state.values() if isinstance(v, torch.Tensor)
-                        )
-                        saved_trainable_param_count = sum(
-                            v.numel() for v in trainable_state.values() if isinstance(v, torch.Tensor)
-                        )
-                        log.info(
-                            f"Actual saved params -> frozen: {saved_frozen_param_count:,} | per-iter: {saved_trainable_param_count:,}"
-                        )
-
-                        # Cast model tensors to bfloat16 on disk to reduce load-time memory and avoid FP32 spikes.
-                        def cast_fp_to_bf16(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-                            out: dict[str, torch.Tensor] = {}
-                            for kk, vv in d.items():
-                                if isinstance(vv, torch.Tensor) and vv.is_floating_point():
-                                    out[kk] = vv.to(torch.bfloat16)
-                                else:
-                                    out[kk] = vv
-                            return out
-
-                        frozen_state = cast_fp_to_bf16(frozen_state)
-                        trainable_state = cast_fp_to_bf16(trainable_state)
-
-                        # Save frozen part once (idempotent)
-                        frozen_checkpoint_path = os.path.join(model_dir, "frozen.pt")
-                        if not os.path.exists(frozen_checkpoint_path) and len(frozen_state) > 0:
+                        # If requested, save the full model without splitting for sanity checks
+                        if self.save_full_model:
                             try:
-                                torch.save(misc.to(frozen_state, device="cpu"), frozen_checkpoint_path)
-                                log.success(f"Saved frozen model checkpoint (local): {frozen_checkpoint_path}")
-                            except Exception as e:
-                                log.exception(f"Frozen checkpoint failed to save (local): {e}")
+                                sentinel_mode = os.path.join(model_dir, "saving_mode.txt")
+                                with open(sentinel_mode, "w") as f:
+                                    f.write("full\n")
+                                log.warning("Full checkpoint save mode enabled: NOT splitting model (saving full state_dict)")
+                            except Exception:
+                                pass
+                            # Cast model tensors to bfloat16 on disk to reduce load-time memory and avoid FP32 spikes.
+                            def cast_fp_to_bf16_full(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+                                out: dict[str, torch.Tensor] = {}
+                                for kk, vv in d.items():
+                                    if isinstance(vv, torch.Tensor) and vv.is_floating_point():
+                                        out[kk] = vv.to(torch.bfloat16)
+                                    else:
+                                        out[kk] = vv
+                                return out
 
-                        # Drop a lightweight sentinel so inference can detect BF16
-                        # without opening large checkpoint files.
-                        try:
-                            sentinel = os.path.join(model_dir, "dtype_bfloat16.txt")
-                            if not os.path.exists(sentinel):
-                                with open(sentinel, "w") as f:
-                                    f.write("bfloat16\n")
-                        except Exception:
-                            pass
-
-                        # For this iteration checkpoint, only keep trainable/mutable tensors if there is a meaningful split
-                        if len(trainable_state) > 0 and len(frozen_state) > 0:
-                            state_dict = trainable_state
+                            state_dict = cast_fp_to_bf16_full(state_dict)
+                            # Drop a lightweight sentinel so inference can detect BF16
+                            try:
+                                sentinel = os.path.join(model_dir, "dtype_bfloat16.txt")
+                                if not os.path.exists(sentinel):
+                                    with open(sentinel, "w") as f:
+                                        f.write("bfloat16\n")
+                            except Exception:
+                                pass
+                            # Leave state_dict as-is (full). Skip frozen/delta split entirely.
+                            # Continue to the generic save path below.
                         else:
-                            # No split (e.g., full fine-tune) -> save full dict
-                            state_dict = state_dict
+                            # Build mapping from Parameter id to its fully-qualified name
+                            id_to_name = {id(p): n for n, p in model.named_parameters(recurse=True)}
+
+                            # Helper to normalize names so they can be matched between
+                            # model.named_parameters() and state_dict() keys. We drop the
+                            # top-level prefixes and anchor at {dit, dit_ema, net, net_ema}.
+                            def normalize_name(name: str) -> str:
+                                # Fast path: if using state_dict keys with prefixes 'net.'/'net_ema.'
+                                if name.startswith("net."):
+                                    return name.split(".", 1)[1]
+                                if name.startswith("net_ema."):
+                                    return name.split(".", 1)[1]
+                                # Parameter names often look like 'pipe.dit....' or 'pipe.dit_ema....'
+                                if ".dit." in name:
+                                    return name.split(".dit.", 1)[1]
+                                if ".dit_ema." in name:
+                                    return name.split(".dit_ema.", 1)[1]
+                                # Fallback: drop the first component if any
+                                return name.split(".", 1)[1] if "." in name else name
+
+                            # Collect trainable parameter normalized suffixes (from optimizer param groups)
+                            trainable_suffixes = set()
+                            raw_trainable_names = set()
+                            for pg in optimizer.param_groups:
+                                for p in pg.get("params", []):
+                                    raw_name = id_to_name.get(id(p))
+                                    if raw_name is None:
+                                        continue
+                                    raw_trainable_names.add(raw_name)
+                                    trainable_suffixes.add(normalize_name(raw_name))
+
+                            def is_trainable_key(k: str) -> bool:
+                                # Treat any LoRA adapter tensors as trainable by construction to avoid
+                                # accidental omission due to naming normalization mismatches.
+                                if "lora" in k.lower():
+                                    return True
+                                # Normalize state_dict key first and match against optimizer-derived names
+                                k_norm = normalize_name(k)
+                                if k_norm in trainable_suffixes:
+                                    return True
+                                # For EMA entries, we still compare by normalized suffix
+                                if "ema" in k.lower():
+                                    return k_norm in trainable_suffixes
+                                return False
+
+                            frozen_state = {}
+                            trainable_state = {}
+                            lora_total = 0
+                            lora_trainable = 0
+                            for k, v in state_dict.items():
+                                if is_trainable_key(k):
+                                    trainable_state[k] = v
+                                    if "lora" in k.lower():
+                                        lora_total += 1
+                                        lora_trainable += 1
+                                else:
+                                    frozen_state[k] = v
+                                    if "lora" in k.lower():
+                                        lora_total += 1
+
+                            # Record mode sentinel for split saves
+                            try:
+                                sentinel_mode = os.path.join(model_dir, "saving_mode.txt")
+                                with open(sentinel_mode, "w") as f:
+                                    f.write("split\n")
+                            except Exception:
+                                pass
+
+                            # Sanity-logging: parameter counts (match training logs) and tensor counts per split
+                            all_param_names = {n for n, _ in model.named_parameters(recurse=True)}
+                            trainable_param_names = {n for n in all_param_names if n in raw_trainable_names}
+                            frozen_param_names = all_param_names - trainable_param_names
+                            trainable_param_count = sum(
+                                p.numel() for n, p in model.named_parameters(recurse=True) if n in trainable_param_names
+                            )
+                            frozen_param_count = sum(
+                                p.numel() for n, p in model.named_parameters(recurse=True) if n in frozen_param_names
+                            )
+                            log.info(
+                                f"Checkpoint split -> frozen params: {frozen_param_count:,} | trainable params: {trainable_param_count:,}"
+                            )
+                            log.info(
+                                f"Saving-once tensors (frozen): {len(frozen_state)} | per-iter tensors (trainable): {len(trainable_state)}"
+                            )
+                            if lora_total > 0:
+                                log.info(
+                                    f"LoRA tensors in state_dict: total={lora_total} | routed to per-iter={lora_trainable} | to frozen={lora_total - lora_trainable}"
+                                )
+                            # Additional sanity: number of parameters actually being saved (sum of tensor sizes)
+                            saved_frozen_param_count = sum(
+                                v.numel() for v in frozen_state.values() if isinstance(v, torch.Tensor)
+                            )
+                            saved_trainable_param_count = sum(
+                                v.numel() for v in trainable_state.values() if isinstance(v, torch.Tensor)
+                            )
+                            log.info(
+                                f"Actual saved params -> frozen: {saved_frozen_param_count:,} | per-iter: {saved_trainable_param_count:,}"
+                            )
+
+                            # Cast model tensors to bfloat16 on disk to reduce load-time memory and avoid FP32 spikes.
+                            def cast_fp_to_bf16(d: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+                                out: dict[str, torch.Tensor] = {}
+                                for kk, vv in d.items():
+                                    if isinstance(vv, torch.Tensor) and vv.is_floating_point():
+                                        out[kk] = vv.to(torch.bfloat16)
+                                    else:
+                                        out[kk] = vv
+                                return out
+
+                            frozen_state = cast_fp_to_bf16(frozen_state)
+                            trainable_state = cast_fp_to_bf16(trainable_state)
+
+                            # Save frozen part once (idempotent)
+                            frozen_checkpoint_path = os.path.join(model_dir, "frozen.pt")
+                            if not os.path.exists(frozen_checkpoint_path) and len(frozen_state) > 0:
+                                try:
+                                    torch.save(misc.to(frozen_state, device="cpu"), frozen_checkpoint_path)
+                                    log.success(f"Saved frozen model checkpoint (local): {frozen_checkpoint_path}")
+                                except Exception as e:
+                                    log.exception(f"Frozen checkpoint failed to save (local): {e}")
+
+                            # Drop a lightweight sentinel so inference can detect BF16
+                            # without opening large checkpoint files.
+                            try:
+                                sentinel = os.path.join(model_dir, "dtype_bfloat16.txt")
+                                if not os.path.exists(sentinel):
+                                    with open(sentinel, "w") as f:
+                                        f.write("bfloat16\n")
+                            except Exception:
+                                pass
+
+                            # For this iteration checkpoint, only keep trainable/mutable tensors if there is a meaningful split
+                            if len(trainable_state) > 0 and len(frozen_state) > 0:
+                                state_dict = trainable_state
+                            else:
+                                # No split (e.g., full fine-tune) -> save full dict
+                                state_dict = state_dict
                     except Exception as e:
                         log.exception(
                             f"Failed to split trainable/frozen for checkpointing, falling back to full save: {e}"
@@ -355,16 +399,36 @@ class Checkpointer:
             # Load the state dicts.
             log.info("- Loading the model...")
 
-            # If a frozen checkpoint exists, merge it with the loaded (likely trainable-only) checkpoint
+            # If split mode is active, merge frozen with trainable delta; otherwise skip.
             model_dir = os.path.join(self.checkpoint_dir_local, "model")
+            mode_sentinel = os.path.join(model_dir, "saving_mode.txt")
+            saving_mode = None
+            if os.path.exists(mode_sentinel):
+                try:
+                    saving_mode = open(mode_sentinel).read().strip()
+                except Exception:
+                    saving_mode = None
+
             base_path = os.path.join(model_dir, "frozen.pt")
-            if os.path.exists(base_path):
+            if saving_mode == "split" and os.path.exists(base_path):
                 try:
                     base_sd = torch.load(base_path, map_location=lambda storage, loc: storage)
                     merged = dict(base_sd)
                     merged.update(state_dicts_to_load["model"])  # trainable deltas override frozen/base
                     state_dicts_to_load["model"] = merged
                     log.info("Merged model weights with frozen checkpoint")
+                except Exception as e:
+                    log.exception(f"Failed to merge frozen and trainable checkpoints: {e}")
+            elif saving_mode == "full":
+                log.info("Full checkpoint load mode detected: skipping frozen+delta merge")
+            elif os.path.exists(base_path):
+                # Backward-compatibility: if sentinel missing but frozen exists, assume split.
+                try:
+                    base_sd = torch.load(base_path, map_location=lambda storage, loc: storage)
+                    merged = dict(base_sd)
+                    merged.update(state_dicts_to_load["model"])  # trainable deltas override frozen/base
+                    state_dicts_to_load["model"] = merged
+                    log.info("Merged model weights with frozen checkpoint (legacy mode)")
                 except Exception as e:
                     log.exception(f"Failed to merge frozen and trainable checkpoints: {e}")
 

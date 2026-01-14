@@ -16,8 +16,11 @@
 """
 Tower Building 16fps Video2World experiment configuration.
 
-Dataset: 2x2 composite view (480p) of tower building pick-and-place segments.
+Dataset: 2x2 composite view (480p) of full tower building trajectories.
+Each trajectory shows a robot stacking 5 colored cubes on a white plate.
 Model: Cosmos-Predict2-14B-Video2World with LoRA fine-tuning.
+
+Checkpoint: Cosmos-Predict2-14B-Sample-GR00T-Dreams-DROID/model-480p-16fps.pt (robotics-adapted)
 
 Usage:
     torchrun --nproc_per_node=8 --master_port=12341 \
@@ -47,8 +50,10 @@ def get_sampler(dataset) -> DistributedSampler:
 cs = ConfigStore.instance()
 
 # Tower building 16fps dataset
+# Full trajectories: robot stacking 5 cubes (~10-15s each, 160-240 frames at 16fps)
 # 2x2 composite view at 480p (480x640)
 # num_frames=93 corresponds to state_t=24 (Cosmos 16fps default)
+# Training samples random 93-frame clips from each full trajectory
 tower_building_16fps_video_dataset = L(Dataset)(
     dataset_dir="datasets/tower_building_16fps/train",
     num_frames=93,
@@ -71,7 +76,7 @@ dataloader_tower_building_16fps = L(DataLoader)(
 #   model.config.train_architecture=lora
 finetune_cosmos_cv_v2w_14b_tower_building_16fps = dict(
     defaults=[
-        {"override /model": "predict2_video2world_fsdp_14b"},
+        {"override /model": "predict2_video2world_fsdp_14b_480p_16fps"},
         {"override /optimizer": "fusedadamw"},
         {"override /scheduler": "lambdalinear"},
         {"override /ckpt_type": "standard"},

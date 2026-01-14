@@ -16,8 +16,10 @@
 import argparse
 import os
 import pickle
+import sys
 
 import numpy as np
+from tqdm import tqdm
 
 from imaginaire.auxiliary.text_encoder import CosmosT5TextEncoder, CosmosT5TextEncoderConfig
 from imaginaire.constants import T5_MODEL_DIR
@@ -48,11 +50,16 @@ def main(args) -> None:
     t5_xxl_dir = os.path.join(args.dataset_path, "t5_xxl")
     os.makedirs(t5_xxl_dir, exist_ok=True)
 
+    print(f"[T5 embeddings] Found {len(metas_list)} meta files", flush=True)
+    print(f"[T5 embeddings] Loading T5 encoder...", flush=True)
+
     # Initialize T5
     encoder_config = CosmosT5TextEncoderConfig(ckpt_path=args.cache_dir)
     encoder = CosmosT5TextEncoder(config=encoder_config)
 
-    for meta_filename in metas_list:
+    print(f"[T5 embeddings] Encoder loaded, starting processing...", flush=True)
+
+    for meta_filename in tqdm(metas_list, desc="T5 embeddings", file=sys.stdout):
         t5_xxl_filename = os.path.join(t5_xxl_dir, os.path.basename(meta_filename).replace(".txt", ".pickle"))
         if os.path.exists(t5_xxl_filename):
             # Skip if the file already exists

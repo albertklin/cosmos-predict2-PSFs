@@ -29,12 +29,18 @@ Usage:
         model.config.train_architecture=lora
 """
 
+import os
+
 from hydra.core.config_store import ConfigStore
 from megatron.core import parallel_state
 from torch.utils.data import DataLoader, DistributedSampler
 
 from cosmos_predict2.data.dataset_video import Dataset
 from imaginaire.lazy_config import LazyCall as L
+
+# Dataset path can be overridden via environment variable
+# Set COSMOS_DATASET_DIR to override the default path
+_DATASET_DIR = os.environ.get("COSMOS_DATASET_DIR", "datasets/tower_building_16fps/train")
 
 
 def get_sampler(dataset) -> DistributedSampler:
@@ -55,7 +61,7 @@ cs = ConfigStore.instance()
 # num_frames=93 corresponds to state_t=24 (Cosmos 16fps default)
 # Training samples random 93-frame clips from each full trajectory
 tower_building_16fps_video_dataset = L(Dataset)(
-    dataset_dir="datasets/tower_building_16fps/train",
+    dataset_dir=_DATASET_DIR,
     num_frames=93,
     video_size=(480, 640),
 )

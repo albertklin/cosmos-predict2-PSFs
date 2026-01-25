@@ -133,12 +133,15 @@ def setup_lora_pipeline(
     assert sum(p.numel() for p in pipe.conditioner.parameters() if p.requires_grad) == 0, (
         "conditioner should not have learnable parameters"
     )
-    # Load prompt refiner
-    pipe.prompt_refiner = CosmosReason1(
-        checkpoint_dir=config.prompt_refiner_config.checkpoint_dir,
-        offload_model_to_cpu=config.prompt_refiner_config.offload_model_to_cpu,
-        enabled=config.prompt_refiner_config.enabled,
-    )
+    # Load prompt refiner only if enabled
+    if config.prompt_refiner_config.enabled:
+        pipe.prompt_refiner = CosmosReason1(
+            checkpoint_dir=config.prompt_refiner_config.checkpoint_dir,
+            offload_model_to_cpu=config.prompt_refiner_config.offload_model_to_cpu,
+            enabled=True,
+        )
+    else:
+        pipe.prompt_refiner = None
     if config.guardrail_config.enabled:
         from cosmos_predict2.auxiliary.guardrail.common import presets as guardrail_presets
 
@@ -201,22 +204,56 @@ def setup_lora_pipeline(
         # Split state dict for regular and EMA models
         state_dict_dit_regular = dict()
         state_dict_dit_ema = dict()
+        # Build set of LoRA target module suffixes for key remapping
+        lora_target_suffixes = tuple(f".{m}.weight" for m in args.lora_target_modules.split(","))
+
         def _normalize_dit_key(key: str, prefix: str) -> str:
             key = key[len(prefix) :]
             if key.startswith("module."):
-                return key[len("module.") :]
+                key = key[len("module.") :]
             if key.startswith("module_ema."):
-                return key[len("module_ema.") :]
+                key = key[len("module_ema.") :]
+            return key
+
+        def _remap_to_peft_key(key: str) -> str:
+            """Remap checkpoint keys to PEFT-compatible keys.
+
+            PEFT wraps target modules so that:
+            - module.weight -> module.base_layer.weight
+            - LoRA weights remain as module.lora_A.default.weight, etc.
+            """
+            # Skip LoRA keys - they don't need remapping
+            if "lora" in key.lower():
+                return key
+            # Remap base weights for LoRA target modules
+            for suffix in lora_target_suffixes:
+                if key.endswith(suffix):
+                    return key[: -len(".weight")] + ".base_layer.weight"
             return key
 
         for k, v in state_dict.items():
             if k.startswith("net."):
-                state_dict_dit_regular[_normalize_dit_key(k, "net.")] = v
+                normalized_key = _normalize_dit_key(k, "net.")
+                remapped_key = _remap_to_peft_key(normalized_key)
+                state_dict_dit_regular[remapped_key] = v
             elif k.startswith("net_ema."):
-                state_dict_dit_ema[_normalize_dit_key(k, "net_ema.")] = v
+                normalized_key = _normalize_dit_key(k, "net_ema.")
+                remapped_key = _remap_to_peft_key(normalized_key)
+                state_dict_dit_ema[remapped_key] = v
         log.info(
             f"Checkpoint tensors split into {len(state_dict_dit_regular)} regular and {len(state_dict_dit_ema)} EMA entries"
         )
+        # Handle --load_ema: use EMA weights for generation (load into pipe.dit)
+        if args.load_ema:
+            if state_dict_dit_ema:
+                log.info("--load_ema: Using EMA weights for generation")
+                # Replace LoRA keys in regular dict with EMA LoRA keys
+                # Keep base model weights from regular dict, overlay EMA LoRA weights
+                for k, v in state_dict_dit_ema.items():
+                    state_dict_dit_regular[k] = v
+                log.info(f"Merged {len(state_dict_dit_ema)} EMA keys into regular state dict")
+            else:
+                log.warning("--load_ema specified but no EMA weights found in checkpoint; using regular weights")
         if not state_dict_dit_regular:
             log.warning("No regular DiT weights were found in the checkpoint; base model will remain uninitialized")
         # Load regular model with strict=False to allow LoRA weights
@@ -228,8 +265,8 @@ def setup_lora_pipeline(
             log.info("All regular DiT parameters were loaded from the checkpoint")
         if missing_keys.unexpected_keys:
             log.warning(f"Unexpected keys in regular model: {missing_keys.unexpected_keys}")
-        # Load EMA model if enabled
-        if config.ema.enabled and state_dict_dit_ema:
+        # Load EMA model if enabled (for training state preservation, not used for inference with --load_ema)
+        if config.ema.enabled and state_dict_dit_ema and not args.load_ema:
             log.info("Loading EMA DiT model weights...")
             missing_keys_ema = pipe.dit_ema.load_state_dict(state_dict_dit_ema, strict=False, assign=True)
             if missing_keys_ema.missing_keys:
@@ -238,7 +275,7 @@ def setup_lora_pipeline(
                 log.info("All EMA DiT parameters were loaded from the checkpoint")
             if missing_keys_ema.unexpected_keys:
                 log.warning(f"Unexpected keys in EMA model: {missing_keys_ema.unexpected_keys}")
-        elif config.ema.enabled:
+        elif config.ema.enabled and not args.load_ema:
             log.warning("EMA is enabled but no EMA weights were found in the checkpoint")
         del state_dict, state_dict_dit_regular, state_dict_dit_ema
         log.success(f"Successfully loaded LoRA checkpoint from {dit_path}")

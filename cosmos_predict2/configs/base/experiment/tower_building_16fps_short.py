@@ -14,10 +14,12 @@
 # limitations under the License.
 
 """
-Tower Building 16fps Video2World experiment configuration.
+Tower Building 16fps Video2World experiment configuration (short videos).
 
-Dataset: 2x2 composite view (480p) of full tower building trajectories.
-Each trajectory shows a robot stacking 5 colored cubes on a white plate.
+For shorter trajectories (e.g., single block placement) that don't have 93+ frames.
+Uses state_t=16 (num_frames=61) instead of state_t=24 (num_frames=93).
+
+Dataset: 2x2 composite view (480p) of tower building trajectories.
 Model: Cosmos-Predict2-14B-Video2World with LoRA fine-tuning.
 
 Checkpoint: Cosmos-Predict2-14B-Sample-GR00T-Dreams-DROID/model-480p-16fps.pt (robotics-adapted)
@@ -25,7 +27,7 @@ Checkpoint: Cosmos-Predict2-14B-Sample-GR00T-Dreams-DROID/model-480p-16fps.pt (r
 Usage:
     torchrun --nproc_per_node=8 --master_port=12341 \
         -m scripts.train --config=cosmos_predict2/configs/base/config.py -- \
-        experiment=finetune_cosmos_cv_v2w_14b_tower_building_16fps \
+        experiment=finetune_cosmos_cv_v2w_14b_tower_building_16fps_short \
         model.config.train_architecture=lora
 """
 
@@ -55,32 +57,32 @@ def get_sampler(dataset) -> DistributedSampler:
 
 cs = ConfigStore.instance()
 
-# Tower building 16fps dataset
-# Full trajectories: robot stacking 5 cubes (~10-15s each, 160-240 frames at 16fps)
+# Tower building 16fps dataset (short videos)
+# Single block placement trajectories: ~3-6 seconds (48-96 frames at 16fps)
 # 2x2 composite view at 480p (480x640)
-# num_frames=93 corresponds to state_t=24 (Cosmos 16fps default)
-# Training samples random 93-frame clips from each full trajectory
-tower_building_16fps_video_dataset = L(Dataset)(
+# num_frames=61 corresponds to state_t=16
+# Requires videos with at least 61 frames
+tower_building_16fps_short_video_dataset = L(Dataset)(
     dataset_dir=_DATASET_DIR,
-    num_frames=93,
+    num_frames=61,
     video_size=(480, 640),
 )
 
-dataloader_tower_building_16fps = L(DataLoader)(
-    dataset=tower_building_16fps_video_dataset,
-    sampler=L(get_sampler)(dataset=tower_building_16fps_video_dataset),
+dataloader_tower_building_16fps_short = L(DataLoader)(
+    dataset=tower_building_16fps_short_video_dataset,
+    sampler=L(get_sampler)(dataset=tower_building_16fps_short_video_dataset),
     batch_size=1,
     drop_last=True,
     num_workers=8,
     pin_memory=True,
 )
 
-# 14B LoRA fine-tuning for tower building
+# 14B LoRA fine-tuning for tower building (short videos)
 # torchrun --nproc_per_node=8 --master_port=12341 -m scripts.train \
 #   --config=cosmos_predict2/configs/base/config.py -- \
-#   experiment=finetune_cosmos_cv_v2w_14b_tower_building_16fps \
+#   experiment=finetune_cosmos_cv_v2w_14b_tower_building_16fps_short \
 #   model.config.train_architecture=lora
-finetune_cosmos_cv_v2w_14b_tower_building_16fps = dict(
+finetune_cosmos_cv_v2w_14b_tower_building_16fps_short = dict(
     defaults=[
         {"override /model": "predict2_video2world_fsdp_14b_480p_16fps"},
         {"override /optimizer": "fusedadamw"},
@@ -92,7 +94,7 @@ finetune_cosmos_cv_v2w_14b_tower_building_16fps = dict(
     job=dict(
         project="posttraining",
         group="video2world_lora",
-        name="14b_tower_building_16fps",
+        name="14b_tower_building_16fps_short",
     ),
     model=dict(
         config=dict(
@@ -103,6 +105,7 @@ finetune_cosmos_cv_v2w_14b_tower_building_16fps = dict(
             init_lora_weights=True,
             fsdp_shard_size=8,
             pipe_config=dict(
+                state_t=16,  # Override: use shorter temporal context (61 frames instead of 93)
                 ema=dict(enabled=True),
                 prompt_refiner_config=dict(enabled=False),
                 guardrail_config=dict(enabled=False),
@@ -112,7 +115,7 @@ finetune_cosmos_cv_v2w_14b_tower_building_16fps = dict(
     model_parallel=dict(
         context_parallel_size=8,
     ),
-    dataloader_train=dataloader_tower_building_16fps,
+    dataloader_train=dataloader_tower_building_16fps_short,
     trainer=dict(
         distributed_parallelism="fsdp",
         callbacks=dict(
@@ -136,7 +139,7 @@ finetune_cosmos_cv_v2w_14b_tower_building_16fps = dict(
 )
 
 for _item in [
-    finetune_cosmos_cv_v2w_14b_tower_building_16fps,
+    finetune_cosmos_cv_v2w_14b_tower_building_16fps_short,
 ]:
     experiment_name = [name.lower() for name, value in globals().items() if value is _item][0]  # noqa: RUF015
     cs.store(

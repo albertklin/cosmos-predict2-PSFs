@@ -28,8 +28,12 @@ def print_environment_info(args: argparse.Namespace):
     from imaginaire.utils import log
 
     try:
-        git_branch = subprocess.check_output("git rev-parse --abbrev-ref HEAD", shell=True, text=True).strip()
-        git_revision = subprocess.check_output("git rev-parse HEAD", shell=True, text=True).strip()
+        git_branch = subprocess.check_output(
+            "git rev-parse --abbrev-ref HEAD", shell=True, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+        git_revision = subprocess.check_output(
+            "git rev-parse HEAD", shell=True, text=True, stderr=subprocess.DEVNULL
+        ).strip()
         log.info(f"git.branch: {git_branch}")
         log.info(f"git.revision: {git_revision}")
     except Exception:

@@ -448,6 +448,52 @@ class Checkpointer:
                     elif key.startswith("net_ema."):
                         state_dicts_to_load_for_dit_ema[key.replace("net_ema.", "")] = val
 
+                # Patch TransformerEngine modules to handle _EXTRA_STATE placeholders from
+                # PyTorch distributed checkpoint. TE's set_extra_state expects tensors with .numel()
+                # but set_model_state_dict creates _EXTRA_STATE placeholders for missing extra_state.
+                # We patch set_extra_state to skip these placeholders gracefully.
+                #
+                # IMPORTANT: This is only safe when FP8 is disabled. TransformerEngine's _extra_state
+                # stores FP8 quantization metadata (_fp8_metas). If FP8 is enabled, skipping the
+                # placeholder would lose FP8 scaling factors and amax history, causing incorrect
+                # quantization on resume.
+                from torch.distributed.checkpoint.state_dict import _EXTRA_STATE
+
+                def _check_fp8_disabled(module):
+                    """Verify FP8 is disabled - our _EXTRA_STATE patch would lose FP8 state."""
+                    if hasattr(module, "_fp8_metas") and module._fp8_metas:
+                        raise RuntimeError(
+                            "FP8 training detected but checkpoint resume with split saving does not "
+                            "support FP8. TransformerEngine's _extra_state contains FP8 metadata "
+                            "that would be lost. Disable FP8 or use full checkpoint saving mode."
+                        )
+                    for child in module.children():
+                        _check_fp8_disabled(child)
+
+                _check_fp8_disabled(model.pipe.dit)
+                if model.pipe.config.ema.enabled:
+                    _check_fp8_disabled(model.pipe.dit_ema)
+
+                def _patch_te_extra_state(module):
+                    """Wrap set_extra_state to gracefully handle _EXTRA_STATE placeholders."""
+                    if hasattr(module, "set_extra_state") and not getattr(module, "_extra_state_patched", False):
+                        original_set = module.set_extra_state
+
+                        def patched_set_extra_state(state):
+                            if isinstance(state, _EXTRA_STATE):
+                                return  # Skip placeholder - no actual extra state to load
+                            return original_set(state)
+
+                        module.set_extra_state = patched_set_extra_state
+                        module._extra_state_patched = True
+                    for child in module.children():
+                        _patch_te_extra_state(child)
+
+                log.info("Patching TransformerEngine modules to handle _EXTRA_STATE placeholders")
+                _patch_te_extra_state(model.pipe.dit)
+                if model.pipe.config.ema.enabled:
+                    _patch_te_extra_state(model.pipe.dit_ema)
+
                 # Load Regular weights.
                 set_model_state_dict(
                     model.pipe.dit,

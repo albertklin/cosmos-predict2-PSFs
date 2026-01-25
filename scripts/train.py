@@ -2,6 +2,7 @@ import wandb, os
 wandb.init(
     project=os.environ.get("WANDB_PROJECT", "default"),
     entity=os.environ.get("WANDB_ENTITY"),
+    group=os.environ.get("WANDB_GROUP"),
     name=os.environ.get("WANDB_NAME"))
 
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.

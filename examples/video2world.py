@@ -493,6 +493,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Video2World + NATTEN (sparse attention variant).",
     )
+    parser.add_argument(
+        "--state_t",
+        type=int,
+        default=None,
+        help="Number of latent frames for generation. Output pixel frames = (state_t - 1) * 4 + 1. "
+        "If not specified, uses the default from the pipeline config (usually 24). "
+        "Should match training state_t for fine-tuned models.",
+    )
     return parser.parse_args()
 
 
@@ -502,6 +510,14 @@ def setup_pipeline(args: argparse.Namespace, text_encoder: CosmosTextEncoder | N
     config = get_cosmos_predict2_video2world_pipeline(
         model_size=args.model_size, resolution=args.resolution, fps=args.fps, natten=getattr(args, "natten", False)
     )
+
+    # Override state_t if specified (controls output video length)
+    if hasattr(args, "state_t") and args.state_t is not None:
+        original_state_t = config.state_t
+        config.state_t = args.state_t
+        pixel_frames = (args.state_t - 1) * 4 + 1
+        log.info(f"Overriding state_t: {original_state_t} -> {args.state_t} (output: {pixel_frames} pixel frames)")
+
     if hasattr(args, "dit_path") and args.dit_path:
         dit_path = args.dit_path
     else:

@@ -448,6 +448,62 @@ class Checkpointer:
                     elif key.startswith("net_ema."):
                         state_dicts_to_load_for_dit_ema[key.replace("net_ema.", "")] = val
 
+                # Transform checkpoint keys to match model parameter names.
+                # When using checkpoint_wrapper for activation checkpointing, the model's
+                # named_parameters() returns keys WITH "_checkpoint_wrapped_module" prefix,
+                # but state_dict() (during save) returns keys WITHOUT the prefix.
+                # set_model_state_dict() doesn't have transparent key translation like
+                # regular load_state_dict(), so we must transform keys manually.
+                def transform_keys_for_checkpoint_wrapper(
+                    state_dict: collections.OrderedDict, dit_module
+                ) -> collections.OrderedDict:
+                    """Add _checkpoint_wrapped_module prefix to keys if model expects them."""
+                    # Get model's actual parameter names to detect the pattern
+                    model_param_names = {n for n, _ in dit_module.named_parameters()}
+                    sample_model_key = next(iter(model_param_names), "")
+                    model_has_wrapper = "_checkpoint_wrapped_module" in sample_model_key
+
+                    sample_ckpt_key = next(iter(state_dict.keys()), "")
+                    ckpt_has_wrapper = "_checkpoint_wrapped_module" in sample_ckpt_key
+
+                    if model_has_wrapper and not ckpt_has_wrapper:
+                        log.info("Transforming checkpoint keys: adding _checkpoint_wrapped_module prefix")
+                        transformed = collections.OrderedDict()
+                        for k, v in state_dict.items():
+                            # Pattern: blocks.N.xxx -> blocks.N._checkpoint_wrapped_module.xxx
+                            parts = k.split(".")
+                            new_parts = []
+                            for i, part in enumerate(parts):
+                                new_parts.append(part)
+                                # Insert _checkpoint_wrapped_module after block index (blocks.N)
+                                if part == "blocks" and i + 1 < len(parts) and parts[i + 1].isdigit():
+                                    pass  # Will add after index
+                                elif i > 0 and parts[i - 1] == "blocks" and part.isdigit():
+                                    new_parts.append("_checkpoint_wrapped_module")
+                            transformed[".".join(new_parts)] = v
+                        return transformed
+                    return state_dict
+
+                state_dicts_to_load_for_dit_reg = transform_keys_for_checkpoint_wrapper(
+                    state_dicts_to_load_for_dit_reg, model.pipe.dit
+                )
+                if state_dicts_to_load_for_dit_ema:
+                    state_dicts_to_load_for_dit_ema = transform_keys_for_checkpoint_wrapper(
+                        state_dicts_to_load_for_dit_ema, model.pipe.dit_ema if model.pipe.config.ema.enabled else model.pipe.dit
+                    )
+
+                # Diagnostic logging: verify key format after transformation
+                sample_ckpt_keys = list(state_dicts_to_load_for_dit_reg.keys())[:3]
+                sample_model_params = [n for n, _ in model.pipe.dit.named_parameters()][:3]
+                log.info(f"[CKPT DEBUG] Sample checkpoint keys after transform: {sample_ckpt_keys}")
+                log.info(f"[CKPT DEBUG] Sample model parameter names: {sample_model_params}")
+                lora_ckpt_keys = [k for k in state_dicts_to_load_for_dit_reg.keys() if "lora" in k.lower()]
+                lora_model_params = [n for n, _ in model.pipe.dit.named_parameters() if "lora" in n.lower()]
+                log.info(f"[CKPT DEBUG] LoRA keys in checkpoint: {len(lora_ckpt_keys)}, in model: {len(lora_model_params)}")
+                if lora_ckpt_keys and lora_model_params:
+                    log.info(f"[CKPT DEBUG] Sample LoRA ckpt key: {lora_ckpt_keys[0]}")
+                    log.info(f"[CKPT DEBUG] Sample LoRA model param: {lora_model_params[0]}")
+
                 # Patch TransformerEngine modules to handle _EXTRA_STATE placeholders from
                 # PyTorch distributed checkpoint. TE's set_extra_state expects tensors with .numel()
                 # but set_model_state_dict creates _EXTRA_STATE placeholders for missing extra_state.
